@@ -123,6 +123,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         // Behavior
         if (it instanceof Mob mob) {
             // Pathfinding (Force move to player)
+            // Use speed 1.0 (100% of attribute) to ensure it keeps trying to move
             mob.getPathfinder().moveTo(victim.getLocation(), 1.0);
             mob.setTarget(victim);
 
@@ -137,6 +138,9 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
             // Door Breaker
             handleDoors(mob);
+            
+            // Spider Climbing / Obstacle Navigation
+            handleClimbing(mob);
 
             // Water
             if (!canEnterWater && mob.isInWater()) {
@@ -195,6 +199,9 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
             living.setSilent(true);
             living.setRemoveWhenFarAway(false);
+            
+            // Prevent entity from despawning due to standard Minecraft mechanics
+            living.setPersistent(true);
         }
     }
 
@@ -241,6 +248,42 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
                 }
             }
         }
+    }
+    
+    // --- SPIDER CLIMBING LOGIC ---
+    private void handleClimbing(Mob mob) {
+        Location loc = mob.getLocation();
+        
+        // Calculate the block strictly in front of the mob based on where it's facing
+        Vector direction = loc.getDirection().setY(0).normalize();
+        
+        // Check slightly ahead (0.6 blocks) at feet and head level
+        Block frontFeet = loc.clone().add(direction.clone().multiply(0.6)).getBlock();
+        Block frontHead = loc.clone().add(0, 1, 0).add(direction.clone().multiply(0.6)).getBlock();
+
+        // If hitting a solid block (that isn't a door/gate we plan to open)
+        if (isObstacle(frontFeet) || isObstacle(frontHead)) {
+            // Apply upward velocity (Spider Climb)
+            // 0.2 is roughly ladder climbing speed
+            Vector velocity = mob.getVelocity();
+            velocity.setY(0.2);
+            
+            // Add a tiny forward nudge so it lands on top of the block when it crests
+            velocity.add(direction.multiply(0.1));
+            
+            mob.setVelocity(velocity);
+            
+            // Fall damage protection (optional, but good if it climbs high)
+            mob.setFallDistance(0);
+        }
+    }
+    
+    private boolean isObstacle(Block b) {
+        // It's an obstacle if it's solid, but NOT if it's a door/gate (we open those)
+        return b.getType().isSolid() 
+                && !b.getType().toString().contains("DOOR") 
+                && !b.getType().toString().contains("GATE")
+                && !b.getType().toString().contains("TRAPDOOR");
     }
 
     // --- Listeners ---
