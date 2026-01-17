@@ -116,7 +116,6 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         autoCurseIfEmpty = config.getBoolean("auto_curse_if_empty", true);
         transferCooldownSeconds = config.getInt("curse_transfer_cooldown", 3);
         
-        // Changed "bee" to "vex" in config keys
         vexModeEnabled = config.getBoolean("vex_mode_enabled", true);
         vexTriggerSeconds = config.getInt("vex_trigger_seconds", 10);
         vexDurationSeconds = config.getInt("vex_duration_seconds", 10);
@@ -201,7 +200,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             
             // Vex Aggression
             if (isVexMode && mob instanceof Vex vex) {
-                vex.setCharging(true); // Makes Vex angry/active
+                vex.setCharging(true); 
             }
 
             // Water
@@ -234,16 +233,20 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         // --- Vex Timer (Turn back to walker) ---
         if (isVexMode) {
             secondsInVexMode++;
+            // Check 1: Has enough time passed?
             if (secondsInVexMode >= vexDurationSeconds) {
-                Player victim = (cursedPlayerUUID != null) ? Bukkit.getPlayer(cursedPlayerUUID) : null;
-                if (victim != null) morphEntity((Mob) it, victim, null);
+                // Check 2: Are we close to the ground? (Prevent air-drops)
+                if (isSafeToLand((Mob) it)) {
+                    Player victim = (cursedPlayerUUID != null) ? Bukkit.getPlayer(cursedPlayerUUID) : null;
+                    if (victim != null) morphEntity((Mob) it, victim, null);
+                }
+                // If not safe to land, we just wait until the next check (remain Vex)
             }
             return;
         }
 
         // --- Walker Stuck Logic (Turn into Vex) ---
         if (lastStalkerPos != null) {
-            // Threshold 0.1 for true stuck check
             if (it.getLocation().distance(lastStalkerPos) < 0.1) {
                 secondsStuck++;
             } else {
@@ -256,6 +259,19 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             Player victim = (cursedPlayerUUID != null) ? Bukkit.getPlayer(cursedPlayerUUID) : null;
             if (victim != null) morphEntity((Mob) it, victim, EntityType.VEX);
         }
+    }
+    
+    // --- Helper to check for ground beneath Vex ---
+    private boolean isSafeToLand(Mob mob) {
+        Location loc = mob.getLocation();
+        // Check 1 to 4 blocks below
+        for (int i = 1; i <= 4; i++) {
+            Block b = loc.clone().subtract(0, i, 0).getBlock();
+            if (b.getType().isSolid()) {
+                return true; // We found ground close enough
+            }
+        }
+        return false; // We are high in the sky
     }
 
     private void spawnIt(Player target) {
@@ -296,10 +312,8 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         Entity entity = spawnLoc.getWorld().spawnEntity(spawnLoc, type);
         itEntityUUID = entity.getUniqueId();
         
-        // Tag entity
         entity.getPersistentDataContainer().set(stalkerKey, PersistentDataType.BYTE, (byte) 1);
 
-        // Update state
         isVexMode = (type == EntityType.VEX);
         secondsStuck = 0;
         lastStalkerPos = spawnLoc.clone();
@@ -311,11 +325,9 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             }
             living.setHealth(100.0);
 
-            // Set Movement Speed (0.12)
             if (living.getAttribute(Attribute.MOVEMENT_SPEED) != null) {
                 living.getAttribute(Attribute.MOVEMENT_SPEED).setBaseValue(0.12);
             }
-            // Set Flying Speed for Vex
             if (living.getAttribute(Attribute.FLYING_SPEED) != null) {
                  living.getAttribute(Attribute.FLYING_SPEED).setBaseValue(0.12);
             }
