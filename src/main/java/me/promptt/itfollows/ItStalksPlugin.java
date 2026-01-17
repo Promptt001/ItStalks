@@ -4,6 +4,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
+import org.bukkit.NamespacedKey;
 import org.bukkit.World;
 import org.bukkit.attribute.Attribute;
 import org.bukkit.block.Block;
@@ -20,6 +21,8 @@ import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.world.ChunkLoadEvent;
+import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
@@ -38,9 +41,12 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
     // Bee / Stuck Logic State
     private Location lastStalkerPos = null;
-    private int ticksStuck = 0;
-    private int ticksInBeeMode = 0;
+    private int secondsStuck = 0;
+    private int secondsInBeeMode = 0;
     private boolean isBeeMode = false;
+    
+    // Identity Key for Persistence (Fixes Duplicate Issue)
+    private NamespacedKey stalkerKey;
 
     // Config cache
     private int logoutRetargetDelay;
@@ -59,10 +65,15 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
     @Override
     public void onEnable() {
+        this.stalkerKey = new NamespacedKey(this, "is_stalker");
+        
         saveDefaultConfig();
         loadConfig();
         getServer().getPluginManager().registerEvents(this, this);
         Objects.requireNonNull(getCommand("startcurse")).setExecutor(this);
+
+        // CLEANUP: Kill any persistent stalkers from previous restarts to fix duplicates
+        cleanOldEntities();
 
         // Main Logic Loop (Runs every 5 ticks = 0.25 seconds)
         new BukkitRunnable() {
@@ -71,6 +82,15 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
                 tickLogic();
             }
         }.runTaskTimer(this, 20L, 5L);
+        
+        // Stuck Check Loop (Runs every 20 ticks = 1.0 second)
+        // Separating this makes the check much more reliable against jitter
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                checkStuckStatus();
+            }
+        }.runTaskTimer(this, 20L, 20L);
 
         getLogger().info("ItStalks has been enabled. Run.");
     }
@@ -78,6 +98,16 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     @Override
     public void onDisable() {
         removeItEntity();
+    }
+    
+    private void cleanOldEntities() {
+        for (World world : Bukkit.getWorlds()) {
+            for (Entity e : world.getEntities()) {
+                if (e.getPersistentDataContainer().has(stalkerKey, PersistentDataType.BYTE)) {
+                    e.remove();
+                }
+            }
+        }
     }
 
     private void loadConfig() {
@@ -119,6 +149,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             if ((System.currentTimeMillis() - cursedLogoutTime) / 1000 > logoutRetargetDelay) {
                 pickRandomTarget();
             }
+            // If victim is offline, we remove the entity so it doesn't stand around
             removeItEntity();
             return;
         } else {
@@ -132,10 +163,12 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         Entity it = (itEntityUUID != null) ? Bukkit.getEntity(itEntityUUID) : null;
 
-        // Respawn logic
+        // Respawn logic if missing
+        // If 'it' is null (unloaded chunk or dead), we respawn.
+        // The Tag cleanup handles duplicates if the old one was merely unloaded.
         if (it == null || !it.isValid() || it.getLocation().distance(victim.getLocation()) > 120) {
             if (it != null) it.remove();
-            spawnIt(victim); // This spawns a normal walker
+            spawnIt(victim); 
             return;
         }
 
@@ -159,9 +192,12 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             
             // Wall Climbing (Only if not a bee)
             if (!isBeeMode) handleClimbing(mob);
-
-            // Bee Transformation / Stuck Logic
-            handleStuckLogic(mob, victim);
+            
+            // Bee Aggression Tweaks
+            if (isBeeMode && mob instanceof Bee bee) {
+                bee.setCannotEnterHiveTicks(Integer.MAX_VALUE);
+                bee.setAnger(Integer.MAX_VALUE);
+            }
 
             // Water
             if (!canEnterWater && mob.isInWater()) {
@@ -184,21 +220,48 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         }
     }
 
+    private void checkStuckStatus() {
+        if (!beeModeEnabled || itEntityUUID == null) return;
+        
+        Entity it = Bukkit.getEntity(itEntityUUID);
+        if (it == null || !it.isValid()) return;
+        
+        // --- Bee Timer (Turn back to walker) ---
+        if (isBeeMode) {
+            secondsInBeeMode++;
+            if (secondsInBeeMode >= beeDurationSeconds) {
+                // Time to land
+                Player victim = (cursedPlayerUUID != null) ? Bukkit.getPlayer(cursedPlayerUUID) : null;
+                if (victim != null) morphEntity((Mob) it, victim, null);
+            }
+            return;
+        }
+
+        // --- Walker Stuck Logic (Turn into Bee) ---
+        if (lastStalkerPos != null) {
+            // Check if moved less than 1.5 blocks in the last SECOND
+            if (it.getLocation().distance(lastStalkerPos) < 1.5) {
+                secondsStuck++;
+            } else {
+                secondsStuck = 0;
+            }
+        }
+        lastStalkerPos = it.getLocation();
+
+        if (secondsStuck >= beeTriggerSeconds) {
+            Player victim = (cursedPlayerUUID != null) ? Bukkit.getPlayer(cursedPlayerUUID) : null;
+            if (victim != null) morphEntity((Mob) it, victim, EntityType.BEE);
+        }
+    }
+
     private void spawnIt(Player target) {
         spawnSpecificEntity(target.getLocation(), target, null);
     }
 
-    /**
-     * Spawns the entity at a specific location or randomizes if loc is null.
-     * @param specificLoc The location to spawn (if null, calculates random offset)
-     * @param target The victim
-     * @param forcedType If not null, forces this specific EntityType (e.g., BEE)
-     */
     private void spawnSpecificEntity(Location specificLoc, Player target, EntityType forcedType) {
         Location spawnLoc;
         
         if (specificLoc == null) {
-            // Calculate spawn location behind player or random radius
             spawnLoc = target.getLocation();
             double angle = Math.random() * 2 * Math.PI;
             spawnLoc.add(Math.cos(angle) * minTeleportDistance, 0, Math.sin(angle) * minTeleportDistance);
@@ -221,14 +284,15 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         Entity entity = spawnLoc.getWorld().spawnEntity(spawnLoc, type);
         itEntityUUID = entity.getUniqueId();
-
-        // Update state flags based on type
-        isBeeMode = (type == EntityType.BEE);
         
-        // Reset counters
-        ticksStuck = 0;
+        // MARK THE ENTITY so we can delete duplicates later
+        entity.getPersistentDataContainer().set(stalkerKey, PersistentDataType.BYTE, (byte) 1);
+
+        // Update state flags
+        isBeeMode = (type == EntityType.BEE);
+        secondsStuck = 0;
         lastStalkerPos = spawnLoc.clone();
-        if (isBeeMode) ticksInBeeMode = 0;
+        if (isBeeMode) secondsInBeeMode = 0;
 
         if (entity instanceof LivingEntity living) {
             if (living.getAttribute(Attribute.MAX_HEALTH) != null) {
@@ -255,48 +319,6 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         }
     }
 
-    private void handleStuckLogic(Mob mob, Player victim) {
-        if (!beeModeEnabled) return;
-
-        // Logic runs every 5 ticks. 
-        // 20 ticks = 1 second. 4 runs = 1 second.
-        
-        if (isBeeMode) {
-            // WE ARE A BEE
-            // Logic: Count up, if duration exceeded, turn back to walker
-            ticksInBeeMode += 5;
-            
-            // Standard bee movement is flying, but pathfinder handles it.
-            // Just ensure it doesn't get distracted by flowers.
-            if (mob instanceof Bee bee) {
-                bee.setCannotEnterHiveTicks(Integer.MAX_VALUE);
-                bee.setAnger(Integer.MAX_VALUE); // Keeps it aggressive/moving
-            }
-
-            if (ticksInBeeMode >= (beeDurationSeconds * 20)) {
-                // Time to land
-                morphEntity(mob, victim, null); // Null forces random walker type
-            }
-            
-        } else {
-            // WE ARE A WALKER
-            // Logic: Check if we moved.
-            if (lastStalkerPos != null) {
-                if (mob.getLocation().distance(lastStalkerPos) < 0.2) {
-                    ticksStuck += 5;
-                } else {
-                    ticksStuck = 0;
-                }
-            }
-            lastStalkerPos = mob.getLocation();
-
-            if (ticksStuck >= (beeTriggerSeconds * 20)) {
-                // Stuck too long, become a bee!
-                morphEntity(mob, victim, EntityType.BEE);
-            }
-        }
-    }
-
     private void morphEntity(Mob oldEntity, Player victim, EntityType newType) {
         Location loc = oldEntity.getLocation();
         oldEntity.remove();
@@ -313,7 +335,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             itEntityUUID = null;
         }
         isBeeMode = false;
-        ticksStuck = 0;
+        secondsStuck = 0;
     }
 
     private void pickRandomTarget() {
@@ -398,6 +420,18 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             
             attacker.sendMessage(ChatColor.GREEN + "You have passed the curse to " + victim.getName() + "!");
             victim.sendMessage(ChatColor.DARK_RED + "" + ChatColor.BOLD + "TAG! You are now Cursed.");
+        }
+    }
+    
+    // Safety check: When any chunk loads, if it contains an "Old" Stalker that isn't our current one, delete it.
+    @EventHandler
+    public void onChunkLoad(ChunkLoadEvent event) {
+        for (Entity e : event.getChunk().getEntities()) {
+            if (e.getPersistentDataContainer().has(stalkerKey, PersistentDataType.BYTE)) {
+                if (itEntityUUID == null || !e.getUniqueId().equals(itEntityUUID)) {
+                    e.remove(); // Kill the duplicate
+                }
+            }
         }
     }
 
