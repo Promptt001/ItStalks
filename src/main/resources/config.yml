@@ -1,9 +1,31 @@
+# Time (seconds) to wait for a disconnected cursed player before retargeting
 logout_retarget_delay: 300
+
+# Minimum distance the entity must be from the player to spawn/teleport
 min_teleport_distance: 50
-fatigue_duration: 100
-fatigue_range: 10
+
+# Mining Fatigue configuration
+fatigue_duration: 100 # ticks
+fatigue_range: 10 # blocks
+
+# If false, the entity will bounce off water
 can_enter_water: false
+
+# If true, picks a random player if the server has no cursed player
 auto_curse_if_empty: true
+
+# The cooldown (in seconds) preventing the cursed player from passing it back immediately
+curse_transfer_cooldown: 3
+
+# --- Bee Mode (Anti-Stuck) ---
+# If the stalker gets stuck, it turns into a Bee to fly to the target.
+bee_mode_enabled: true
+# How many seconds the stalker must be stuck/still before turning into a bee
+bee_trigger_seconds: 10
+# How long (seconds) it stays as a bee before turning back into a walker
+bee_duration_seconds: 10
+
+# Allowed forms for "It" (Standard walking forms)
 allowed_forms:
   - ZOMBIE
   - SKELETON
