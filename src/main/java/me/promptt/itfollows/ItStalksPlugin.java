@@ -145,7 +145,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             if ((System.currentTimeMillis() - cursedLogoutTime) / 1000 > logoutRetargetDelay) {
                 pickRandomTarget();
             }
-            return; // Don't delete entity, just wait
+            return;
         } else {
             cursedLogoutTime = -1;
         }
@@ -195,6 +195,9 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             // Wall Climbing (Only if not a bee)
             if (!isBeeMode) handleClimbing(mob);
             
+            // Ladder Descent (FIX for Bobbing)
+            handleLadderDescent(mob, victim);
+            
             // Bee Aggression
             if (isBeeMode && mob instanceof Bee bee) {
                 bee.setCannotEnterHiveTicks(Integer.MAX_VALUE);
@@ -240,9 +243,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         // --- Walker Stuck Logic (Turn into Bee) ---
         if (lastStalkerPos != null) {
-            // FIX: Lower threshold from 1.5 to 0.1
-            // Since movement speed is 0.12, normal walking is slow.
-            // We only want to trigger this if it is TRULY stuck (barely moving).
+            // Threshold 0.1 for true stuck check
             if (it.getLocation().distance(lastStalkerPos) < 0.1) {
                 secondsStuck++;
             } else {
@@ -258,7 +259,6 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     }
 
     private void spawnIt(Player target) {
-        // FIX: Pass NULL for location so it calculates the random offset
         spawnSpecificEntity(null, target, null);
     }
 
@@ -312,13 +312,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             }
             living.setHealth(100.0);
 
-            // FIX: Ensure speed is set slow for EVERYONE, including Bees
             if (living.getAttribute(Attribute.MOVEMENT_SPEED) != null) {
                 living.getAttribute(Attribute.MOVEMENT_SPEED).setBaseValue(0.12);
             }
-            
-            // Some versions use FLYING_SPEED for bees, if it exists, clamp it too
-            // Note: In 1.21 generic.flying_speed might vary, but movement_speed covers most pathfinding
+            // Clamp Flying Speed for bees
             if (living.getAttribute(Attribute.FLYING_SPEED) != null) {
                  living.getAttribute(Attribute.FLYING_SPEED).setBaseValue(0.12);
             }
@@ -340,7 +337,6 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     private void morphEntity(Mob oldEntity, Player victim, EntityType newType) {
         Location loc = oldEntity.getLocation();
         oldEntity.remove();
-        // Spawning exactly where the old one was
         spawnSpecificEntity(loc, victim, newType);
         if (loc.getWorld() != null) loc.getWorld().playEffect(loc, org.bukkit.Effect.MOBSPAWNER_FLAMES, 0);
     }
@@ -392,8 +388,31 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         }
     }
     
+    // --- LADDER FIX ---
+    private void handleLadderDescent(Mob mob, Player victim) {
+        String blockType = mob.getLocation().getBlock().getType().toString();
+        // Check if we are physically inside a ladder or vine
+        if (blockType.contains("LADDER") || blockType.contains("VINE")) {
+            // If the player is BELOW the stalker, force downward movement
+            if (victim.getLocation().getY() < mob.getLocation().getY()) {
+                 Vector vel = mob.getVelocity();
+                 vel.setY(-0.15); // Gentle downward push
+                 mob.setVelocity(vel);
+                 mob.setFallDistance(0);
+            }
+        }
+    }
+    
     private void handleClimbing(Mob mob) {
         Location loc = mob.getLocation();
+        
+        // FIX: ABORT SPIDER CLIMB IF ON A LADDER
+        // If we are touching a ladder, let standard movement or handleLadderDescent take over.
+        String blockName = loc.getBlock().getType().toString();
+        if (blockName.contains("LADDER") || blockName.contains("VINE")) {
+            return;
+        }
+
         Vector direction = loc.getDirection().setY(0).normalize();
         Block frontFeet = loc.clone().add(direction.clone().multiply(0.6)).getBlock();
         Block frontHead = loc.clone().add(0, 1, 0).add(direction.clone().multiply(0.6)).getBlock();
@@ -408,10 +427,14 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     }
     
     private boolean isObstacle(Block b) {
+        String name = b.getType().toString();
         return b.getType().isSolid() 
-                && !b.getType().toString().contains("DOOR") 
-                && !b.getType().toString().contains("GATE")
-                && !b.getType().toString().contains("TRAPDOOR");
+                && !name.contains("DOOR") 
+                && !name.contains("GATE")
+                && !name.contains("TRAPDOOR")
+                // Explicitly ignore ladder-like blocks as obstacles so we don't try to climb the wall behind them
+                && !name.contains("LADDER")
+                && !name.contains("VINE");
     }
 
     @EventHandler
