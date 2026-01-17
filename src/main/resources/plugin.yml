@@ -1,0 +1,13 @@
+name: ItStalks
+version: '${project.version}'
+main: me.promptt.itfollows.ItStalksPlugin
+api-version: '1.21'
+permissions:
+  itstalks.admin:
+    description: Allows using the startcurse command
+    default: op
+commands:
+  startcurse:
+    description: Starts the curse on a specific player
+    usage: /startcurse <player>
+    permission: itstalks.admin

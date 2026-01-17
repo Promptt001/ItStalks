@@ -1,0 +1,15 @@
+logout_retarget_delay: 300
+min_teleport_distance: 50
+fatigue_duration: 100
+fatigue_range: 10
+can_enter_water: false
+auto_curse_if_empty: true
+allowed_forms:
+  - ZOMBIE
+  - SKELETON
+  - VILLAGER
+  - PIG
+  - COW
+  - HUSK
+  - STRAY
+  - DROWNED
