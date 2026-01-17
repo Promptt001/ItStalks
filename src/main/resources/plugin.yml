@@ -4,10 +4,14 @@ main: me.promptt.itfollows.ItStalksPlugin
 api-version: '1.21'
 permissions:
   itstalks.admin:
-    description: Allows using the startcurse command
+    description: Allows using the admin commands
     default: op
 commands:
   startcurse:
     description: Starts the curse on a specific player
     usage: /startcurse <player>
+    permission: itstalks.admin
+  cursereload:
+    description: Reloads the config.yml file
+    usage: /cursereload
     permission: itstalks.admin

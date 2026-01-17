@@ -69,7 +69,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         saveDefaultConfig();
         loadConfig();
         getServer().getPluginManager().registerEvents(this, this);
+        
+        // Register Commands
         Objects.requireNonNull(getCommand("startcurse")).setExecutor(this);
+        Objects.requireNonNull(getCommand("cursereload")).setExecutor(this);
 
         cleanOldEntities();
 
@@ -240,7 +243,6 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
                     Player victim = (cursedPlayerUUID != null) ? Bukkit.getPlayer(cursedPlayerUUID) : null;
                     if (victim != null) morphEntity((Mob) it, victim, null);
                 }
-                // If not safe to land, we just wait until the next check (remain Vex)
             }
             return;
         }
@@ -268,10 +270,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         for (int i = 1; i <= 4; i++) {
             Block b = loc.clone().subtract(0, i, 0).getBlock();
             if (b.getType().isSolid()) {
-                return true; // We found ground close enough
+                return true;
             }
         }
-        return false; // We are high in the sky
+        return false;
     }
 
     private void spawnIt(Player target) {
@@ -506,6 +508,12 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             }
             setCursedPlayer(target);
             sender.sendMessage(ChatColor.RED + "Curse started on " + target.getName());
+            return true;
+        }
+        else if (command.getName().equalsIgnoreCase("cursereload")) {
+            reloadConfig();
+            loadConfig();
+            sender.sendMessage(ChatColor.GREEN + "ItStalks configuration reloaded!");
             return true;
         }
         return false;
