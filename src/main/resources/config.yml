@@ -17,13 +17,13 @@ auto_curse_if_empty: true
 # The cooldown (in seconds) preventing the cursed player from passing it back immediately
 curse_transfer_cooldown: 3
 
-# --- Bee Mode (Anti-Stuck) ---
-# If the stalker gets stuck, it turns into a Bee to fly to the target.
-bee_mode_enabled: true
-# How many seconds the stalker must be stuck/still before turning into a bee
-bee_trigger_seconds: 10
-# How long (seconds) it stays as a bee before turning back into a walker
-bee_duration_seconds: 10
+# --- Vex Mode (Anti-Stuck) ---
+# If the stalker gets stuck, it turns into a Vex (Ghost) to fly/phase to the target.
+vex_mode_enabled: true
+# How many seconds the stalker must be stuck/still before turning into a Vex
+vex_trigger_seconds: 10
+# How long (seconds) it stays as a Vex before turning back into a walker
+vex_duration_seconds: 10
 
 # Allowed forms for "It" (Standard walking forms)
 allowed_forms:

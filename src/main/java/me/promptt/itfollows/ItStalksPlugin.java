@@ -38,11 +38,11 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     private long cursedLogoutTime = -1;
     private long lastTransferTime = 0;
 
-    // Bee / Stuck Logic State
+    // Vex / Stuck Logic State
     private Location lastStalkerPos = null;
     private int secondsStuck = 0;
-    private int secondsInBeeMode = 0;
-    private boolean isBeeMode = false;
+    private int secondsInVexMode = 0;
+    private boolean isVexMode = false;
     
     // Identity Key for Persistence
     private NamespacedKey stalkerKey;
@@ -55,10 +55,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     private boolean autoCurseIfEmpty;
     private int transferCooldownSeconds;
     
-    // Bee Config
-    private boolean beeModeEnabled;
-    private int beeTriggerSeconds;
-    private int beeDurationSeconds;
+    // Vex Config
+    private boolean vexModeEnabled;
+    private int vexTriggerSeconds;
+    private int vexDurationSeconds;
 
     private List<EntityType> allowedForms = new ArrayList<>();
 
@@ -116,9 +116,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         autoCurseIfEmpty = config.getBoolean("auto_curse_if_empty", true);
         transferCooldownSeconds = config.getInt("curse_transfer_cooldown", 3);
         
-        beeModeEnabled = config.getBoolean("bee_mode_enabled", true);
-        beeTriggerSeconds = config.getInt("bee_trigger_seconds", 10);
-        beeDurationSeconds = config.getInt("bee_duration_seconds", 10);
+        // Changed "bee" to "vex" in config keys
+        vexModeEnabled = config.getBoolean("vex_mode_enabled", true);
+        vexTriggerSeconds = config.getInt("vex_trigger_seconds", 10);
+        vexDurationSeconds = config.getInt("vex_duration_seconds", 10);
 
         allowedForms.clear();
         for (String s : config.getStringList("allowed_forms")) {
@@ -192,16 +193,15 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             // Door Breaker
             handleDoors(mob);
             
-            // Wall Climbing (Only if not a bee)
-            if (!isBeeMode) handleClimbing(mob);
+            // Wall Climbing (Only if not a Vex)
+            if (!isVexMode) handleClimbing(mob);
             
-            // Ladder Descent (FIX for Bobbing)
+            // Ladder Descent
             handleLadderDescent(mob, victim);
             
-            // Bee Aggression
-            if (isBeeMode && mob instanceof Bee bee) {
-                bee.setCannotEnterHiveTicks(Integer.MAX_VALUE);
-                bee.setAnger(Integer.MAX_VALUE);
+            // Vex Aggression
+            if (isVexMode && mob instanceof Vex vex) {
+                vex.setCharging(true); // Makes Vex angry/active
             }
 
             // Water
@@ -226,22 +226,22 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     }
 
     private void checkStuckStatus() {
-        if (!beeModeEnabled || itEntityUUID == null) return;
+        if (!vexModeEnabled || itEntityUUID == null) return;
         
         Entity it = Bukkit.getEntity(itEntityUUID);
         if (it == null || !it.isValid()) return;
         
-        // --- Bee Timer (Turn back to walker) ---
-        if (isBeeMode) {
-            secondsInBeeMode++;
-            if (secondsInBeeMode >= beeDurationSeconds) {
+        // --- Vex Timer (Turn back to walker) ---
+        if (isVexMode) {
+            secondsInVexMode++;
+            if (secondsInVexMode >= vexDurationSeconds) {
                 Player victim = (cursedPlayerUUID != null) ? Bukkit.getPlayer(cursedPlayerUUID) : null;
                 if (victim != null) morphEntity((Mob) it, victim, null);
             }
             return;
         }
 
-        // --- Walker Stuck Logic (Turn into Bee) ---
+        // --- Walker Stuck Logic (Turn into Vex) ---
         if (lastStalkerPos != null) {
             // Threshold 0.1 for true stuck check
             if (it.getLocation().distance(lastStalkerPos) < 0.1) {
@@ -252,9 +252,9 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         }
         lastStalkerPos = it.getLocation();
 
-        if (secondsStuck >= beeTriggerSeconds) {
+        if (secondsStuck >= vexTriggerSeconds) {
             Player victim = (cursedPlayerUUID != null) ? Bukkit.getPlayer(cursedPlayerUUID) : null;
-            if (victim != null) morphEntity((Mob) it, victim, EntityType.BEE);
+            if (victim != null) morphEntity((Mob) it, victim, EntityType.VEX);
         }
     }
 
@@ -274,7 +274,6 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             
             spawnLoc.add(xOffset, 0, zOffset);
             
-            // Safe Chunk Check
             int chunkX = spawnLoc.getBlockX() >> 4;
             int chunkZ = spawnLoc.getBlockZ() >> 4;
             if (!world.isChunkLoaded(chunkX, chunkZ)) return;
@@ -301,10 +300,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         entity.getPersistentDataContainer().set(stalkerKey, PersistentDataType.BYTE, (byte) 1);
 
         // Update state
-        isBeeMode = (type == EntityType.BEE);
+        isVexMode = (type == EntityType.VEX);
         secondsStuck = 0;
         lastStalkerPos = spawnLoc.clone();
-        if (isBeeMode) secondsInBeeMode = 0;
+        if (isVexMode) secondsInVexMode = 0;
 
         if (entity instanceof LivingEntity living) {
             if (living.getAttribute(Attribute.MAX_HEALTH) != null) {
@@ -312,10 +311,11 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             }
             living.setHealth(100.0);
 
+            // Set Movement Speed (0.12)
             if (living.getAttribute(Attribute.MOVEMENT_SPEED) != null) {
                 living.getAttribute(Attribute.MOVEMENT_SPEED).setBaseValue(0.12);
             }
-            // Clamp Flying Speed for bees
+            // Set Flying Speed for Vex
             if (living.getAttribute(Attribute.FLYING_SPEED) != null) {
                  living.getAttribute(Attribute.FLYING_SPEED).setBaseValue(0.12);
             }
@@ -347,7 +347,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             if (e != null) e.remove();
             itEntityUUID = null;
         }
-        isBeeMode = false;
+        isVexMode = false;
         secondsStuck = 0;
     }
 
@@ -388,15 +388,12 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         }
     }
     
-    // --- LADDER FIX ---
     private void handleLadderDescent(Mob mob, Player victim) {
         String blockType = mob.getLocation().getBlock().getType().toString();
-        // Check if we are physically inside a ladder or vine
         if (blockType.contains("LADDER") || blockType.contains("VINE")) {
-            // If the player is BELOW the stalker, force downward movement
             if (victim.getLocation().getY() < mob.getLocation().getY()) {
                  Vector vel = mob.getVelocity();
-                 vel.setY(-0.15); // Gentle downward push
+                 vel.setY(-0.15);
                  mob.setVelocity(vel);
                  mob.setFallDistance(0);
             }
@@ -406,8 +403,6 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     private void handleClimbing(Mob mob) {
         Location loc = mob.getLocation();
         
-        // FIX: ABORT SPIDER CLIMB IF ON A LADDER
-        // If we are touching a ladder, let standard movement or handleLadderDescent take over.
         String blockName = loc.getBlock().getType().toString();
         if (blockName.contains("LADDER") || blockName.contains("VINE")) {
             return;
@@ -432,7 +427,6 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
                 && !name.contains("DOOR") 
                 && !name.contains("GATE")
                 && !name.contains("TRAPDOOR")
-                // Explicitly ignore ladder-like blocks as obstacles so we don't try to climb the wall behind them
                 && !name.contains("LADDER")
                 && !name.contains("VINE");
     }
