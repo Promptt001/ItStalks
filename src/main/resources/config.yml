@@ -17,6 +17,13 @@ auto_curse_if_empty: true
 # The cooldown (in seconds) preventing the cursed player from passing it back immediately
 curse_transfer_cooldown: 3
 
+# --- Stalker Stats ---
+# max_health: the health the stalker spawns with (and respawns with after morphing)
+# damage: the amount of damage (hearts * 2) dealt on a successful melee hit
+stalker:
+  max_health: 100.0
+  damage: 12.0
+
 # --- Vex Mode (Anti-Stuck) ---
 # If the stalker gets stuck, it turns into a Vex (Ghost) to fly/phase to the target.
 vex_mode_enabled: true
@@ -62,7 +69,7 @@ fears:
 
   # Fear avoidance tuning (prevents the stalker from repeatedly entering the fear zone and fleeing)
   # Behaviour notes:
-  #  - If the cursed player is INSIDE the fear radius, the stalker will freeze completely in place.
+  #  - If the cursed player is INSIDE the fear radius, the stalker will walk up to the edge and hold at the perimeter.
   #  - If the cursed player is OUTSIDE the radius but the fear zone blocks the direct path,
   #    the stalker will step around the perimeter until it has a clear route.
   # perimeter_buffer: extra distance added on top of each fear radius to create a stable "edge"

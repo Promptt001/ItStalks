@@ -108,6 +108,13 @@ speeds:
 boat_trap_prevention_radius: 3.5
 ```
 
+### Stalker stats (health & damage)
+```yaml
+stalker:
+  max_health: 100.0
+  damage: 12.0
+```
+
 ### Fears
 ```yaml
 fears:

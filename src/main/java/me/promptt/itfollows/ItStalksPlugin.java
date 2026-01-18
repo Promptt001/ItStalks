@@ -129,6 +129,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
      */
     private double fearAvoidInwardDotThreshold;
 
+    // Stalker stats
+    private double stalkerMaxHealth;
+    private double stalkerDamage;
+
     // Chat messages
     private String msgCurseAssigned;
     private String msgCurseCooldown;
@@ -288,6 +292,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         fearAvoidStepDistance = Math.max(1.0, config.getDouble("fears.avoidance.step_distance", 6.0));
         fearAvoidInwardDotThreshold = config.getDouble("fears.avoidance.inward_dot_threshold", 0.15);
 
+        // Stalker stats
+        stalkerMaxHealth = Math.max(1.0, config.getDouble("stalker.max_health", 100.0));
+        stalkerDamage = Math.max(0.0, config.getDouble("stalker.damage", 12.0));
+
         // Messages
         msgCurseAssigned = config.getString("messages.curse_assigned", "&4&lYou feel a cold chill... It is following you.");
         msgCurseCooldown = config.getString("messages.curse_cooldown", "&cYou cannot pass the curse yet! Wait {seconds}s.");
@@ -446,15 +454,17 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         // --- Safety Radius (Feared Objects) ---
         // If the cursed player is standing inside the safety radius of any fear source,
-        // the stalker should freeze in place (no movement, no turning into a Vex, no attacks).
-        // This is intentionally stronger than simple "edge holding" and fixes the unwanted
-        // perimeter-orbit behavior.
+        // the stalker should approach the perimeter of that fear radius and stop there.
+        // This prevents the "freezing wherever it is" behavior while still respecting the bubble.
         FearSource victimProtection = getVictimProtectionSource(victim.getLocation());
         boolean victimIsProtected = victimProtection != null;
         victimProtectedByFear = victimIsProtected;
 
         if (victimIsProtected) {
-            freezeStalkerInPlace(mob);
+            if (!mob.hasAI()) {
+                mob.setAI(true);
+            }
+            holdAtFearPerimeter(mob, victim, victimProtection);
             return;
         } else {
             // Ensure AI is re-enabled when the victim leaves the safety radius.
@@ -465,7 +475,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         // Fear logic: certain blocks repel the stalker.
         // Updated behavior:
-        //  - If the cursed player is inside any safety radius, the stalker freezes in place.
+        //  - If the cursed player is inside any safety radius, the stalker walks to the edge and holds there.
         //  - Otherwise, feared objects behave as *spherical* no-entry zones:
         //      * walkers step around the perimeter
         //      * Vex (flying) forms can route above the sphere
@@ -505,7 +515,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         // Attack
         if (distToVictim < 1.5) {
             if (victim.getNoDamageTicks() == 0) {
-                victim.damage(12.0, mob);
+                victim.damage(stalkerDamage, mob);
                 mob.swingMainHand();
             }
         }
@@ -685,9 +695,9 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         // Configure stats
         if (entity instanceof LivingEntity living) {
             if (living.getAttribute(Attribute.MAX_HEALTH) != null) {
-                living.getAttribute(Attribute.MAX_HEALTH).setBaseValue(100.0);
+                living.getAttribute(Attribute.MAX_HEALTH).setBaseValue(stalkerMaxHealth);
             }
-            living.setHealth(100.0);
+            living.setHealth(stalkerMaxHealth);
 
             if (living.getAttribute(Attribute.MOVEMENT_SPEED) != null) {
                 double moveSpeed = isVexMode ? vexMovementSpeed : allowedFormsMovementSpeed;
@@ -1147,18 +1157,20 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         Location victimLoc = victim.getLocation();
 
-        // 1) If the victim is inside the BASE fear radius, freeze completely.
+        // 1) If the victim is inside the BASE fear radius, hold at the perimeter.
         //    (This should already be handled by tickLogic, but keep it here for robustness.)
         double victimDist = victimLoc.distance(srcLoc);
         if (victimDist < baseRadius) {
-            freezeStalkerInPlace(mob);
+            holdAtFearPerimeter(mob, victim, fearSource);
             return true;
         }
 
         // 2) Victim is NOT protected by the fear radius.
         //    If the fear zone blocks the direct route, path around the perimeter.
         //    Otherwise, allow the normal chase logic to execute.
-        boolean blocked = segmentIntersectsSphere(mobLoc, victimLoc, srcLoc, perimeterRadius);
+        boolean blocked = canFly
+                ? segmentIntersectsSphere(mobLoc, victimLoc, srcLoc, perimeterRadius)
+                : segmentIntersectsCircleXZ(mobLoc, victimLoc, srcLoc, perimeterRadius);
         if (blocked) {
             Location around;
             if (canFly) {
@@ -1289,6 +1301,9 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         // If the slice is effectively a point (near the top/bottom), fall back to a minimal circle.
         if (sliceRadius < 0.5) sliceRadius = Math.max(0.5, perimeterRadius * 0.35);
 
+        // Stay slightly OUTSIDE the exact perimeter to reduce "bouncing" on the edge.
+        sliceRadius += Math.max(0.25, fearAvoidPerimeterBuffer * 0.35);
+
         double ax = mobLoc.getX() - center.getX();
         double az = mobLoc.getZ() - center.getZ();
         double bx = victimLoc.getX() - center.getX();
@@ -1325,8 +1340,90 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         dir.normalize().multiply(sphereRadius + 2.0);
 
         Location wp = center.clone().add(dir);
-        wp.setY(center.getY() + sphereRadius + 4.0);
+        // Ensure we're meaningfully above the bubble even if the victim is higher up.
+        wp.setY(Math.max(center.getY() + sphereRadius + 4.0, victimLoc.getY() + 3.0));
         return wp;
+    }
+
+    /**
+     * When the cursed player is inside a fear radius, the stalker should approach
+     * the perimeter (edge) of that safety bubble and hold there.
+     */
+    private void holdAtFearPerimeter(Mob mob, Player victim, FearSource protectingSource) {
+        if (mob == null || victim == null || protectingSource == null) return;
+        if (!isSameWorld(mob.getLocation(), protectingSource.location)) return;
+
+        double baseRadius = getBaseFearRadius(protectingSource.type);
+        if (baseRadius <= 0.0) return;
+
+        double perimeterRadius = baseRadius + Math.max(0.0, fearAvoidPerimeterBuffer);
+
+        Location center = protectingSource.location;
+        Location mobLoc = mob.getLocation();
+        Location victimLoc = victim.getLocation();
+
+        final boolean canFly = (mob instanceof Vex) || isVexMode;
+
+        // Target the point on the perimeter that is closest to the victim's direction.
+        Location edge = canFly
+                ? perimeterPointOnSphere(center, victimLoc, perimeterRadius)
+                : perimeterPoint(center, victimLoc, perimeterRadius, mobLoc.getY());
+
+        // If we ended up inside the zone (terrain/pathfinder weirdness), push outward.
+        double mobDist = mobLoc.distance(center);
+        if (mobDist < perimeterRadius) {
+            Vector out = mobLoc.toVector().subtract(center.toVector());
+            if (!canFly) out.setY(0);
+            if (out.lengthSquared() < 0.0001) out = new Vector(1, 0, 0);
+            out.normalize();
+            mob.setVelocity(out.multiply(0.18).setY(0.04));
+        }
+
+        mob.setTarget(null);
+        mob.getPathfinder().moveTo(edge, getCurrentPathfinderSpeed(mob));
+
+        // Prevent anti-stuck from triggering while we're intentionally holding an edge.
+        secondsStuck = 0;
+        lastStalkerPos = mob.getLocation().clone();
+    }
+
+    /**
+     * 2D (XZ) segment-circle intersection. This is used for walker forms so they don't
+     * attempt to "go over" a fear bubble based on a 3D line-of-sight that isn't walkable.
+     */
+    private boolean segmentIntersectsCircleXZ(Location start, Location end, Location center, double radius) {
+        if (!isSameWorld(start, end) || !isSameWorld(start, center)) return false;
+
+        double ax = start.getX() - center.getX();
+        double az = start.getZ() - center.getZ();
+
+        double bx = end.getX() - center.getX();
+        double bz = end.getZ() - center.getZ();
+
+        double dx = bx - ax;
+        double dz = bz - az;
+
+        double r2 = radius * radius;
+
+        // Endpoint checks
+        double a2 = ax * ax + az * az;
+        double b2 = bx * bx + bz * bz;
+        if (a2 < r2) return true;
+        if (b2 < r2) return true;
+
+        double d2 = dx * dx + dz * dz;
+        if (d2 < 0.000001) return false;
+
+        // Solve |a + t d|^2 = r^2 for t in [0,1]
+        double bDot = 2.0 * (ax * dx + az * dz);
+        double c = a2 - r2;
+        double disc = bDot * bDot - 4.0 * d2 * c;
+        if (disc < 0.0) return false;
+
+        double sqrt = Math.sqrt(disc);
+        double t1 = (-bDot - sqrt) / (2.0 * d2);
+        double t2 = (-bDot + sqrt) / (2.0 * d2);
+        return (t1 >= 0.0 && t1 <= 1.0) || (t2 >= 0.0 && t2 <= 1.0);
     }
 
     private double wrapRadians(double r) {
