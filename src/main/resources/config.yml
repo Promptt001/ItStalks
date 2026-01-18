@@ -25,6 +25,39 @@ vex_trigger_seconds: 10
 # How long (seconds) it stays as a Vex before turning back into a walker
 vex_duration_seconds: 10
 
+# --- Speeds ---
+# Note: Minecraft/Paper entity speed depends on both the Attribute values below
+# and the pathfinder move speed ("pathfinder").
+speeds:
+  allowed_forms:
+    movement: 0.12
+    pathfinder: 1.0
+  vex_form:
+    movement: 0.12
+    flying: 0.12
+    pathfinder: 1.0
+
+# --- Boat Trap Prevention ---
+# If a boat is within this radius of the stalker, it will be removed (unless a player is riding it)
+# and the stalker will be pushed away. Set to 0 to disable.
+boat_trap_prevention_radius: 3.5
+
+# --- Fears ---
+# The stalker will flee when it detects these blocks nearby.
+fears:
+  fire:
+    enabled: true
+    radius: 8.0
+  soul_torch:
+    enabled: true
+    radius: 8.0
+  soul_lantern:
+    enabled: true
+    radius: 8.0
+  beacon:
+    enabled: true
+    radius: 16.0
+
 # Allowed forms for "It" (Standard walking forms)
 allowed_forms:
   - ZOMBIE

@@ -4,6 +4,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
 import org.bukkit.attribute.Attribute;
@@ -19,6 +20,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityCombustEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
+import org.bukkit.event.vehicle.VehicleEnterEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.persistence.PersistentDataType;
@@ -60,7 +62,47 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     private int vexTriggerSeconds;
     private int vexDurationSeconds;
 
+    // Speed Config
+    private double allowedFormsMovementSpeed;
+    private double allowedFormsPathfinderSpeed;
+    private double vexMovementSpeed;
+    private double vexFlyingSpeed;
+    private double vexPathfinderSpeed;
+
+    // Boat Trap Prevention
+    private double boatTrapRadius;
+
+    // Fear Config
+    private boolean fearFireEnabled;
+    private double fearFireRadius;
+    private boolean fearSoulTorchEnabled;
+    private double fearSoulTorchRadius;
+    private boolean fearSoulLanternEnabled;
+    private double fearSoulLanternRadius;
+    private boolean fearBeaconEnabled;
+    private double fearBeaconRadius;
+
+    private FearSource cachedFearSource;
+    private long lastFearScanMs = 0;
+
     private List<EntityType> allowedForms = new ArrayList<>();
+
+    private enum FearType {
+        FIRE,
+        SOUL_TORCH,
+        SOUL_LANTERN,
+        BEACON
+    }
+
+    private static class FearSource {
+        final FearType type;
+        final Location location;
+
+        FearSource(FearType type, Location location) {
+            this.type = type;
+            this.location = location;
+        }
+    }
 
     @Override
     public void onEnable() {
@@ -123,6 +165,29 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         vexTriggerSeconds = config.getInt("vex_trigger_seconds", 10);
         vexDurationSeconds = config.getInt("vex_duration_seconds", 10);
 
+        // Speeds
+        allowedFormsMovementSpeed = config.getDouble("speeds.allowed_forms.movement", 0.12);
+        allowedFormsPathfinderSpeed = config.getDouble("speeds.allowed_forms.pathfinder", 1.0);
+        vexMovementSpeed = config.getDouble("speeds.vex_form.movement", 0.12);
+        vexFlyingSpeed = config.getDouble("speeds.vex_form.flying", 0.12);
+        vexPathfinderSpeed = config.getDouble("speeds.vex_form.pathfinder", 1.0);
+
+        // Boat Trap Prevention
+        boatTrapRadius = config.getDouble("boat_trap_prevention_radius", 3.5);
+
+        // Fears
+        fearFireEnabled = config.getBoolean("fears.fire.enabled", true);
+        fearFireRadius = config.getDouble("fears.fire.radius", 8.0);
+
+        fearSoulTorchEnabled = config.getBoolean("fears.soul_torch.enabled", true);
+        fearSoulTorchRadius = config.getDouble("fears.soul_torch.radius", 8.0);
+
+        fearSoulLanternEnabled = config.getBoolean("fears.soul_lantern.enabled", true);
+        fearSoulLanternRadius = config.getDouble("fears.soul_lantern.radius", 8.0);
+
+        fearBeaconEnabled = config.getBoolean("fears.beacon.enabled", true);
+        fearBeaconRadius = config.getDouble("fears.beacon.radius", 16.0);
+
         allowedForms.clear();
         for (String s : config.getStringList("allowed_forms")) {
             try {
@@ -170,18 +235,16 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         Entity it = (itEntityUUID != null) ? Bukkit.getEntity(itEntityUUID) : null;
 
-        // Respawn logic
-        if (it == null || !it.isValid() || it.getLocation().distance(victim.getLocation()) > 120) {
+        // Respawn logic (includes dimension changes)
+        if (it == null || !it.isValid() || !isSameWorld(it.getLocation(), victim.getLocation()) || safeDistance(it.getLocation(), victim.getLocation()) > 120) {
             if (it != null) it.remove();
-            spawnIt(victim); 
+            spawnIt(victim);
             return;
         }
 
         // Behavior
         if (it instanceof Mob mob) {
-            // Pathfinding (Force move to player)
-            mob.getPathfinder().moveTo(victim.getLocation(), 1.0);
-            mob.setTarget(victim);
+            double distToVictim = safeDistance(mob.getLocation(), victim.getLocation());
 
             // Visibility
             for (Player p : Bukkit.getOnlinePlayers()) {
@@ -191,6 +254,20 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
                     p.showEntity(this, mob);
                 }
             }
+
+            // Prevent boat trapping / clean nearby boats
+            handleBoatTrapPrevention(mob);
+
+            // Fear logic: certain blocks repel the stalker
+            FearSource fearSource = getFearSource(mob.getLocation());
+            if (fearSource != null) {
+                handleFear(mob, fearSource);
+                return; // Do not chase/attack while afraid
+            }
+
+            // Pathfinding (Force move to player)
+            mob.getPathfinder().moveTo(victim.getLocation(), getCurrentPathfinderSpeed(mob));
+            mob.setTarget(victim);
 
             // Door Breaker
             handleDoors(mob);
@@ -213,7 +290,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             }
 
             // Attack
-            if (mob.getLocation().distance(victim.getLocation()) < 1.5) {
+            if (distToVictim < 1.5) {
                 if (victim.getNoDamageTicks() == 0) {
                     victim.damage(12.0, mob);
                     mob.swingMainHand();
@@ -222,7 +299,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         }
 
         // Effects
-        if (it.getLocation().distance(victim.getLocation()) <= fatigueRange) {
+        if (safeDistance(it.getLocation(), victim.getLocation()) <= fatigueRange) {
             victim.addPotionEffect(new PotionEffect(PotionEffectType.MINING_FATIGUE, 100, 1, false, false));
         }
     }
@@ -328,10 +405,12 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             living.setHealth(100.0);
 
             if (living.getAttribute(Attribute.MOVEMENT_SPEED) != null) {
-                living.getAttribute(Attribute.MOVEMENT_SPEED).setBaseValue(0.12);
+                double moveSpeed = isVexMode ? vexMovementSpeed : allowedFormsMovementSpeed;
+                living.getAttribute(Attribute.MOVEMENT_SPEED).setBaseValue(moveSpeed);
             }
             if (living.getAttribute(Attribute.FLYING_SPEED) != null) {
-                 living.getAttribute(Attribute.FLYING_SPEED).setBaseValue(0.12);
+                double flySpeed = isVexMode ? vexFlyingSpeed : allowedFormsMovementSpeed;
+                living.getAttribute(Attribute.FLYING_SPEED).setBaseValue(flySpeed);
             }
             
             if (living.getAttribute(Attribute.KNOCKBACK_RESISTANCE) != null) {
@@ -443,6 +522,155 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
                 && !name.contains("TRAPDOOR")
                 && !name.contains("LADDER")
                 && !name.contains("VINE");
+    }
+
+    // --- Cross-dimension safety / distance ---
+    private boolean isSameWorld(Location a, Location b) {
+        if (a == null || b == null) return false;
+        if (a.getWorld() == null || b.getWorld() == null) return false;
+        return a.getWorld().equals(b.getWorld());
+    }
+
+    private double safeDistance(Location a, Location b) {
+        if (!isSameWorld(a, b)) return Double.MAX_VALUE;
+        return a.distance(b);
+    }
+
+    // --- Speed helpers ---
+    private double getCurrentPathfinderSpeed(Mob mob) {
+        if (mob instanceof Vex || isVexMode) {
+            return vexPathfinderSpeed;
+        }
+        return allowedFormsPathfinderSpeed;
+    }
+
+    // --- Boat trap prevention ---
+    private void handleBoatTrapPrevention(Mob mob) {
+        if (boatTrapRadius <= 0) return;
+
+        // If already inside a boat, immediately eject and remove the boat
+        if (mob.getVehicle() instanceof Boat boat) {
+            boat.eject();
+            boat.remove();
+        }
+
+        for (Entity e : mob.getNearbyEntities(boatTrapRadius, boatTrapRadius, boatTrapRadius)) {
+            if (e instanceof Boat boat) {
+                boolean hasPlayerPassenger = boat.getPassengers().stream().anyMatch(p -> p instanceof Player);
+                if (!hasPlayerPassenger) {
+                    boat.remove();
+                }
+
+                Vector away = mob.getLocation().toVector().subtract(boat.getLocation().toVector());
+                if (away.lengthSquared() < 0.0001) away = new Vector(1, 0, 0);
+                away.setY(0).normalize();
+                mob.setVelocity(away.multiply(0.35).setY(0.05));
+            }
+        }
+    }
+
+    @EventHandler
+    public void onStalkerEnterBoat(VehicleEnterEvent event) {
+        if (!(event.getVehicle() instanceof Boat)) return;
+        if (event.getEntered() == null) return;
+        if (event.getEntered().getPersistentDataContainer().has(stalkerKey, PersistentDataType.BYTE)) {
+            event.setCancelled(true);
+        }
+    }
+
+    // --- Fear logic ---
+    private FearSource getFearSource(Location center) {
+        // Throttle: scanning blocks can be expensive
+        long now = System.currentTimeMillis();
+        if (now - lastFearScanMs < 750) {
+            return cachedFearSource;
+        }
+        lastFearScanMs = now;
+        cachedFearSource = scanForFearSource(center);
+        return cachedFearSource;
+    }
+
+    private FearSource scanForFearSource(Location center) {
+        if (center == null || center.getWorld() == null) return null;
+
+        double maxRadius = 0.0;
+        if (fearFireEnabled && fearFireRadius > 0) maxRadius = Math.max(maxRadius, fearFireRadius);
+        if (fearSoulTorchEnabled && fearSoulTorchRadius > 0) maxRadius = Math.max(maxRadius, fearSoulTorchRadius);
+        if (fearSoulLanternEnabled && fearSoulLanternRadius > 0) maxRadius = Math.max(maxRadius, fearSoulLanternRadius);
+        if (fearBeaconEnabled && fearBeaconRadius > 0) maxRadius = Math.max(maxRadius, fearBeaconRadius);
+        if (maxRadius <= 0) return null;
+
+        int r = (int) Math.ceil(maxRadius);
+        int cx = center.getBlockX();
+        int cy = center.getBlockY();
+        int cz = center.getBlockZ();
+
+        FearSource best = null;
+        double bestDist2 = Double.MAX_VALUE;
+
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    int x = cx + dx;
+                    int y = cy + dy;
+                    int z = cz + dz;
+
+                    Block block = center.getWorld().getBlockAt(x, y, z);
+                    Material type = block.getType();
+
+                    FearType fearType = null;
+                    double radius = 0.0;
+
+                    // Fire / Soul Fire
+                    if (fearFireEnabled && fearFireRadius > 0 && (type == Material.FIRE || type == Material.SOUL_FIRE)) {
+                        fearType = FearType.FIRE;
+                        radius = fearFireRadius;
+                    }
+                    // Soul Torch
+                    else if (fearSoulTorchEnabled && fearSoulTorchRadius > 0 && (type == Material.SOUL_TORCH || type == Material.SOUL_WALL_TORCH)) {
+                        fearType = FearType.SOUL_TORCH;
+                        radius = fearSoulTorchRadius;
+                    }
+                    // Soul Lantern
+                    else if (fearSoulLanternEnabled && fearSoulLanternRadius > 0 && type == Material.SOUL_LANTERN) {
+                        fearType = FearType.SOUL_LANTERN;
+                        radius = fearSoulLanternRadius;
+                    }
+                    // Beacon
+                    else if (fearBeaconEnabled && fearBeaconRadius > 0 && type == Material.BEACON) {
+                        fearType = FearType.BEACON;
+                        radius = fearBeaconRadius;
+                    }
+
+                    if (fearType == null) continue;
+
+                    double dist2 = dx * dx + dy * dy + dz * dz;
+                    if (dist2 > radius * radius) continue;
+
+                    if (dist2 < bestDist2) {
+                        bestDist2 = dist2;
+                        best = new FearSource(fearType, block.getLocation().add(0.5, 0.5, 0.5));
+                    }
+                }
+            }
+        }
+
+        return best;
+    }
+
+    private void handleFear(Mob mob, FearSource fearSource) {
+        if (fearSource == null) return;
+
+        Location mobLoc = mob.getLocation();
+        Vector away = mobLoc.toVector().subtract(fearSource.location.toVector());
+        if (away.lengthSquared() < 0.0001) away = new Vector(1, 0, 0);
+        away.setY(0).normalize();
+
+        // Move away a few blocks (pathfinding + a small velocity push)
+        Location fleeTarget = mobLoc.clone().add(away.clone().multiply(8));
+        mob.setTarget(null);
+        mob.getPathfinder().moveTo(fleeTarget, getCurrentPathfinderSpeed(mob));
+        mob.setVelocity(away.multiply(0.30).setY(0.05));
     }
 
     @EventHandler
