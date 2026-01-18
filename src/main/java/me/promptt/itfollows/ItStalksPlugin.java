@@ -495,8 +495,13 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         // Door opening / breaking
         handleDoors(mob);
 
-        // Wall climbing (only if not a Vex)
-        if (!isVexMode) handleClimbing(mob);
+        // NOTE:
+        // The older "spider" wall-climbing logic is no longer necessary now that Vex mode exists
+        // for resolving navigation edge cases. It also tended to interfere with fear-perimeter
+        // holding and produced jittery movement.
+        //
+        // If you ever want this back, re-enable the call below.
+        // if (!isVexMode) handleClimbing(mob);
 
         // Ladder descent
         handleLadderDescent(mob, victim);
@@ -1142,6 +1147,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             if (out.lengthSquared() < 0.0001) out = new Vector(1, 0, 0);
             out.normalize();
             mob.setVelocity(out.multiply(0.12).setY(0.04));
+
+            // Fear avoidance is intentional; never treat this as "stuck".
+            secondsStuck = 0;
+            lastStalkerPos = mobLoc.clone();
             return true;
         }
 
@@ -1152,6 +1161,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
                     : perimeterPoint(srcLoc, mobLoc, perimeterRadius, mobLoc.getY());
             mob.setTarget(null);
             mob.getPathfinder().moveTo(hold, getCurrentPathfinderSpeed(mob));
+
+            // Fear avoidance is intentional; never treat this as "stuck".
+            secondsStuck = 0;
+            lastStalkerPos = mobLoc.clone();
             return true;
         }
 
@@ -1172,15 +1185,19 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
                 ? segmentIntersectsSphere(mobLoc, victimLoc, srcLoc, perimeterRadius)
                 : segmentIntersectsCircleXZ(mobLoc, victimLoc, srcLoc, perimeterRadius);
         if (blocked) {
-            Location around;
-            if (canFly) {
-                // Flying forms can route above the sphere.
-                around = flyOverSphereWaypoint(srcLoc, perimeterRadius, victimLoc);
-            } else {
-                around = stepAlongPerimeterTowardsVictim(srcLoc, mobLoc, victimLoc, perimeterRadius);
-            }
+            // IMPORTANT:
+            // Even in Vex mode we do NOT want to "phase" through the safety bubble by flying over it.
+            // That defeats the purpose of the fear zone and looks unfair.
+            //
+            // Instead we path *around the perimeter* for both walkers and fliers. (Vex can still benefit
+            // from collision-free navigation, but it must respect the bubble as a no-entry volume.)
+            Location around = stepAlongPerimeterTowardsVictim(srcLoc, mobLoc, victimLoc, perimeterRadius);
             mob.setTarget(null);
             mob.getPathfinder().moveTo(around, getCurrentPathfinderSpeed(mob));
+
+            // Fear avoidance is intentional; never treat this as "stuck".
+            secondsStuck = 0;
+            lastStalkerPos = mobLoc.clone();
             return true;
         }
 
@@ -1360,14 +1377,21 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         Location center = protectingSource.location;
         Location mobLoc = mob.getLocation();
-        Location victimLoc = victim.getLocation();
 
         final boolean canFly = (mob instanceof Vex) || isVexMode;
 
-        // Target the point on the perimeter that is closest to the victim's direction.
+        // IMPORTANT:
+        // When the victim is protected by a fear bubble we want the stalker to *walk up to the edge*
+        // and then *hold that edge point* rather than constantly "orbit" the bubble.
+        //
+        // The old behavior targeted the perimeter point "closest to the victim direction", which
+        // causes continuous movement around the bubble as the victim moves.
+        //
+        // New behavior: target the perimeter point on the same radial line from the source -> stalker.
+        // This yields a stable edge point and makes the stalker stand still once it reaches it.
         Location edge = canFly
-                ? perimeterPointOnSphere(center, victimLoc, perimeterRadius)
-                : perimeterPoint(center, victimLoc, perimeterRadius, mobLoc.getY());
+                ? perimeterPointOnSphere(center, mobLoc, perimeterRadius)
+                : perimeterPoint(center, mobLoc, perimeterRadius, mobLoc.getY());
 
         // If we ended up inside the zone (terrain/pathfinder weirdness), push outward.
         double mobDist = mobLoc.distance(center);
@@ -1380,7 +1404,15 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         }
 
         mob.setTarget(null);
-        mob.getPathfinder().moveTo(edge, getCurrentPathfinderSpeed(mob));
+
+        // If we are basically already at the perimeter point, stop issuing move requests.
+        // This prevents the pathfinder from re-steering every tick and keeps the mob "planted".
+        if (mobLoc.distance(edge) <= 0.65) {
+            mob.getPathfinder().stopPathfinding();
+            mob.setVelocity(new Vector(0, Math.min(0.02, mob.getVelocity().getY()), 0));
+        } else {
+            mob.getPathfinder().moveTo(edge, getCurrentPathfinderSpeed(mob));
+        }
 
         // Prevent anti-stuck from triggering while we're intentionally holding an edge.
         secondsStuck = 0;
