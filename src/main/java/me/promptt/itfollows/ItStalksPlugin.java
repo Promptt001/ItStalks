@@ -161,6 +161,15 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     /** True while the cursed player is inside a fear "safe zone". */
     private volatile boolean victimProtectedByFear = false;
 
+    /**
+     * Tracks whether we've already allowed a "protection edge" Vex morph during the current
+     * victim-protected window.
+     *
+     * This prevents rapid cycling: walker holds edge -> morphs to Vex -> morphs back ->
+     * immediately morphs again while the player remains inside the same safety bubble.
+     */
+    private boolean vexTriggeredDuringVictimProtection = false;
+
     // Allowed entity forms for the stalker while walking
     private final List<EntityType> allowedForms = new ArrayList<>();
 
@@ -460,10 +469,12 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         boolean victimIsProtected = victimProtection != null;
         victimProtectedByFear = victimIsProtected;
 
+        // Leaving a protection bubble resets the one-shot "edge Vex" guard.
+        if (!victimIsProtected) {
+            vexTriggeredDuringVictimProtection = false;
+        }
+
         if (victimIsProtected) {
-            if (!mob.hasAI()) {
-                mob.setAI(true);
-            }
             holdAtFearPerimeter(mob, victim, victimProtection);
             return;
         } else {
@@ -583,13 +594,6 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     private void checkStuckStatus() {
         if (!vexModeEnabled || itEntityUUID == null) return;
 
-        // If the cursed player is in a safety radius, the stalker is intentionally frozen.
-        // Do not treat this as "stuck" and never morph into a Vex in this state.
-        if (victimProtectedByFear && !isVexMode) {
-            secondsStuck = 0;
-            return;
-        }
-
         Entity it = Bukkit.getEntity(itEntityUUID);
         if (it == null || !it.isValid()) return;
 
@@ -597,11 +601,15 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         if (isVexMode) {
             secondsInVexMode++;
 
-            // Has enough time passed AND we are close to the ground? (Prevent air-drops)
+            // Once the Vex timer expires we ALWAYS morph back to a walking form.
+            // The morph implementation snaps the spawn location down to safe ground,
+            // which prevents the "stuck hovering forever" edge case.
             if (secondsInVexMode >= vexDurationSeconds) {
-                if (it instanceof Mob mob && isSafeToLand(mob)) {
+                if (it instanceof Mob mob) {
                     Player victim = (cursedPlayerUUID != null) ? Bukkit.getPlayer(cursedPlayerUUID) : null;
-                    if (victim != null) morphEntity(mob, victim, null);
+                    if (victim != null) {
+                        morphEntity(mob, victim, null);
+                    }
                 }
             }
             return;
@@ -609,7 +617,14 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         // --- Walker stuck logic (Turn into Vex) ---
         if (lastStalkerPos != null) {
-            if (it.getLocation().distance(lastStalkerPos) < 0.1) {
+            Location now = it.getLocation();
+            double movedHoriz = horizontalDistance(now, lastStalkerPos);
+            double movedY = Math.abs(now.getY() - lastStalkerPos.getY());
+
+            // Consider "still" as very low horizontal drift and small vertical bob.
+            // This avoids missing stuck events due to tiny perimeter jitter.
+            boolean still = movedHoriz < 0.08 && movedY < 0.25;
+            if (still) {
                 secondsStuck++;
             } else {
                 secondsStuck = 0;
@@ -618,9 +633,19 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         lastStalkerPos = it.getLocation().clone();
 
         if (secondsStuck >= vexTriggerSeconds) {
+            // While the victim remains protected, only allow ONE Vex morph to avoid
+            // constant morph cycling while holding the perimeter.
+            if (victimProtectedByFear && vexTriggeredDuringVictimProtection) {
+                secondsStuck = 0;
+                return;
+            }
+
             Player victim = (cursedPlayerUUID != null) ? Bukkit.getPlayer(cursedPlayerUUID) : null;
             if (victim != null && it instanceof Mob mob) {
                 morphEntity(mob, victim, EntityType.VEX);
+                if (victimProtectedByFear) {
+                    vexTriggeredDuringVictimProtection = true;
+                }
             }
         }
     }
@@ -732,9 +757,53 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
      */
     private void morphEntity(Mob oldEntity, Player victim, EntityType newType) {
         Location loc = oldEntity.getLocation();
+
+        // When morphing OUT of Vex mode (back to a ground walker), snap the spawn point down
+        // onto safe ground so we do not create a walker in mid-air.
+        if (newType == null || newType != EntityType.VEX) {
+            loc = snapToSafeGround(loc, 32);
+        }
         oldEntity.remove();
         spawnSpecificEntity(loc, victim, newType);
         if (loc.getWorld() != null) loc.getWorld().playEffect(loc, org.bukkit.Effect.MOBSPAWNER_FLAMES, 0);
+    }
+
+    /**
+     * Attempts to move a location down onto a safe ground position (solid floor + 2 blocks of headroom).
+     *
+     * This is used primarily when reverting from Vex -> walker to prevent the stalker from being
+     * stranded hovering on a fear perimeter and never returning to a walking form.
+     */
+    private Location snapToSafeGround(Location desired, int maxDownBlocks) {
+        if (desired == null || desired.getWorld() == null) return desired;
+
+        World world = desired.getWorld();
+
+        int x = desired.getBlockX();
+        int z = desired.getBlockZ();
+        int startY = desired.getBlockY();
+
+        int minY = Math.max(world.getMinHeight(), startY - Math.max(1, maxDownBlocks));
+        for (int y = startY; y >= minY; y--) {
+            Block floor = world.getBlockAt(x, y, z);
+            if (!floor.getType().isSolid()) continue;
+
+            Block feet = world.getBlockAt(x, y + 1, z);
+            Block head = world.getBlockAt(x, y + 2, z);
+            if (!feet.getType().isSolid() && !head.getType().isSolid()) {
+                Location out = new Location(world, x + 0.5, y + 1, z + 0.5);
+                out.setYaw(desired.getYaw());
+                out.setPitch(desired.getPitch());
+                return out;
+            }
+        }
+
+        // Fallback: use highest terrain at this XZ.
+        int highest = world.getHighestBlockYAt(x, z);
+        Location out = new Location(world, x + 0.5, highest + 1, z + 0.5);
+        out.setYaw(desired.getYaw());
+        out.setPitch(desired.getPitch());
+        return out;
     }
 
     private void removeItEntity() {
@@ -1135,9 +1204,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         // 0) Always push out if the stalker is inside the perimeter sphere.
         double mobDist = mobLoc.distance(srcLoc);
         if (mobDist < perimeterRadius) {
-            Location edgePoint = canFly
-                    ? perimeterPointOnSphere(srcLoc, mobLoc, perimeterRadius)
-                    : perimeterPoint(srcLoc, mobLoc, perimeterRadius, mobLoc.getY());
+            // Even for Vex forms, keep fear-edge waypoints on the current Y-slice.
+            // This prevents "upper hemisphere" target selection which can look like
+            // the stalker is stuck hovering above the perimeter.
+            Location edgePoint = perimeterPoint(srcLoc, mobLoc, perimeterRadius, mobLoc.getY());
             mob.setTarget(null);
             mob.getPathfinder().moveTo(edgePoint, getCurrentPathfinderSpeed(mob));
 
@@ -1148,23 +1218,15 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             out.normalize();
             mob.setVelocity(out.multiply(0.12).setY(0.04));
 
-            // Fear avoidance is intentional; never treat this as "stuck".
-            secondsStuck = 0;
-            lastStalkerPos = mobLoc.clone();
             return true;
         }
 
         // If we do not have a valid victim context, just hold the perimeter.
         if (victim == null || !victim.isOnline() || !isSameWorld(srcLoc, victim.getLocation())) {
-            Location hold = canFly
-                    ? perimeterPointOnSphere(srcLoc, mobLoc, perimeterRadius)
-                    : perimeterPoint(srcLoc, mobLoc, perimeterRadius, mobLoc.getY());
+            Location hold = perimeterPoint(srcLoc, mobLoc, perimeterRadius, mobLoc.getY());
             mob.setTarget(null);
             mob.getPathfinder().moveTo(hold, getCurrentPathfinderSpeed(mob));
 
-            // Fear avoidance is intentional; never treat this as "stuck".
-            secondsStuck = 0;
-            lastStalkerPos = mobLoc.clone();
             return true;
         }
 
@@ -1195,9 +1257,6 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             mob.setTarget(null);
             mob.getPathfinder().moveTo(around, getCurrentPathfinderSpeed(mob));
 
-            // Fear avoidance is intentional; never treat this as "stuck".
-            secondsStuck = 0;
-            lastStalkerPos = mobLoc.clone();
             return true;
         }
 
@@ -1389,8 +1448,12 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         //
         // New behavior: target the perimeter point on the same radial line from the source -> stalker.
         // This yields a stable edge point and makes the stalker stand still once it reaches it.
+        // NOTE:
+        // For flying forms we intentionally keep the "hold" waypoint near the victim's Y-level.
+        // This prevents the Vex from selecting an "upper" point on the sphere and appearing
+        // stuck hovering in mid-air at the perimeter.
         Location edge = canFly
-                ? perimeterPointOnSphere(center, mobLoc, perimeterRadius)
+                ? perimeterPoint(center, mobLoc, perimeterRadius, victim.getLocation().getY())
                 : perimeterPoint(center, mobLoc, perimeterRadius, mobLoc.getY());
 
         // If we ended up inside the zone (terrain/pathfinder weirdness), push outward.
@@ -1405,18 +1468,20 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         mob.setTarget(null);
 
-        // If we are basically already at the perimeter point, stop issuing move requests.
-        // This prevents the pathfinder from re-steering every tick and keeps the mob "planted".
-        if (mobLoc.distance(edge) <= 0.65) {
+        // If we are basically already at the perimeter point, hard-freeze the mob.
+        // This prevents micro-jitter from repeated path requests.
+        double holdThreshold = canFly ? 1.05 : 0.85;
+        if (mobLoc.distance(edge) <= holdThreshold) {
             mob.getPathfinder().stopPathfinding();
             mob.setVelocity(new Vector(0, Math.min(0.02, mob.getVelocity().getY()), 0));
+            mob.setFallDistance(0);
+            mob.setAI(false);
         } else {
+            if (!mob.hasAI()) {
+                mob.setAI(true);
+            }
             mob.getPathfinder().moveTo(edge, getCurrentPathfinderSpeed(mob));
         }
-
-        // Prevent anti-stuck from triggering while we're intentionally holding an edge.
-        secondsStuck = 0;
-        lastStalkerPos = mob.getLocation().clone();
     }
 
     /**
