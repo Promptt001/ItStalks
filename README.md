@@ -78,7 +78,7 @@ proximity_messages:
   default_cooldown_seconds: 180
   tiers:
     - radius: 30
-      message: "&eTip: Stay in well-lit areas."
+      message: "&eTip: Fire and soul lights can scare it away."
       cooldown_seconds: 180
     - radius: 10
       message: "&cIt's very close. RUN."
