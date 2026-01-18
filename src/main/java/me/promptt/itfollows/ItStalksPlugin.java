@@ -79,8 +79,13 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     private double fearSoulTorchRadius;
     private boolean fearSoulLanternEnabled;
     private double fearSoulLanternRadius;
-    private boolean fearBeaconEnabled;
-    private double fearBeaconRadius;
+    private boolean fearSoulCampfireEnabled;
+    private double fearSoulCampfireRadius;
+
+    // Fear Avoidance (perimeter + pathing)
+    private double fearAvoidPerimeterBuffer;
+    private double fearAvoidStepDistance;
+    private double fearAvoidInwardDotThreshold;
 
     // Chat Messages
     private String msgCurseAssigned;
@@ -108,7 +113,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         FIRE,
         SOUL_TORCH,
         SOUL_LANTERN,
-        BEACON
+        SOUL_CAMPFIRE
     }
 
     private static class FearSource {
@@ -214,8 +219,14 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         fearSoulLanternEnabled = config.getBoolean("fears.soul_lantern.enabled", true);
         fearSoulLanternRadius = config.getDouble("fears.soul_lantern.radius", 8.0);
 
-        fearBeaconEnabled = config.getBoolean("fears.beacon.enabled", true);
-        fearBeaconRadius = config.getDouble("fears.beacon.radius", 16.0);
+        // Soul Campfire (replaces beacon). Falls back to old beacon keys for backwards compatibility.
+        fearSoulCampfireEnabled = config.getBoolean("fears.soul_campfire.enabled", config.getBoolean("fears.beacon.enabled", true));
+        fearSoulCampfireRadius = config.getDouble("fears.soul_campfire.radius", config.getDouble("fears.beacon.radius", 32.0));
+
+        // Fear avoidance tuning (helps stop "run-away / re-enter" oscillation)
+        fearAvoidPerimeterBuffer = Math.max(0.0, config.getDouble("fears.avoidance.perimeter_buffer", 0.75));
+        fearAvoidStepDistance = Math.max(1.0, config.getDouble("fears.avoidance.step_distance", 6.0));
+        fearAvoidInwardDotThreshold = config.getDouble("fears.avoidance.inward_dot_threshold", 0.15);
 
         // Messages (supports color codes with & and placeholders like {victim}, {seconds}, etc.)
         msgCurseAssigned = config.getString("messages.curse_assigned", "&4&lYou feel a cold chill... It is following you.");
@@ -351,7 +362,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             // Fear logic: certain blocks repel the stalker
             FearSource fearSource = getFearSource(mob.getLocation());
             if (fearSource != null) {
-                handleFear(mob, fearSource);
+                handleFear(mob, victim, fearSource);
                 return; // Do not chase/attack while afraid
             }
 
@@ -719,10 +730,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         if (center == null || center.getWorld() == null) return null;
 
         double maxRadius = 0.0;
-        if (fearFireEnabled && fearFireRadius > 0) maxRadius = Math.max(maxRadius, fearFireRadius);
-        if (fearSoulTorchEnabled && fearSoulTorchRadius > 0) maxRadius = Math.max(maxRadius, fearSoulTorchRadius);
-        if (fearSoulLanternEnabled && fearSoulLanternRadius > 0) maxRadius = Math.max(maxRadius, fearSoulLanternRadius);
-        if (fearBeaconEnabled && fearBeaconRadius > 0) maxRadius = Math.max(maxRadius, fearBeaconRadius);
+        if (fearFireEnabled && fearFireRadius > 0) maxRadius = Math.max(maxRadius, fearFireRadius + fearAvoidPerimeterBuffer);
+        if (fearSoulTorchEnabled && fearSoulTorchRadius > 0) maxRadius = Math.max(maxRadius, fearSoulTorchRadius + fearAvoidPerimeterBuffer);
+        if (fearSoulLanternEnabled && fearSoulLanternRadius > 0) maxRadius = Math.max(maxRadius, fearSoulLanternRadius + fearAvoidPerimeterBuffer);
+        if (fearSoulCampfireEnabled && fearSoulCampfireRadius > 0) maxRadius = Math.max(maxRadius, fearSoulCampfireRadius + fearAvoidPerimeterBuffer);
         if (maxRadius <= 0) return null;
 
         int r = (int) Math.ceil(maxRadius);
@@ -761,16 +772,19 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
                         fearType = FearType.SOUL_LANTERN;
                         radius = fearSoulLanternRadius;
                     }
-                    // Beacon
-                    else if (fearBeaconEnabled && fearBeaconRadius > 0 && type == Material.BEACON) {
-                        fearType = FearType.BEACON;
-                        radius = fearBeaconRadius;
+                    // Soul Campfire (replaces Beacon)
+                    else if (fearSoulCampfireEnabled && fearSoulCampfireRadius > 0 && type == Material.SOUL_CAMPFIRE) {
+                        fearType = FearType.SOUL_CAMPFIRE;
+                        radius = fearSoulCampfireRadius;
                     }
 
                     if (fearType == null) continue;
 
                     double dist2 = dx * dx + dy * dy + dz * dz;
-                    if (dist2 > radius * radius) continue;
+                    // Expand the *detection* radius slightly so the stalker can settle at the perimeter
+                    // instead of repeatedly dipping into the forbidden zone and fleeing.
+                    double perimeterRadius = radius + fearAvoidPerimeterBuffer;
+                    if (dist2 > perimeterRadius * perimeterRadius) continue;
 
                     if (dist2 < bestDist2) {
                         bestDist2 = dist2;
@@ -783,20 +797,100 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         return best;
     }
 
-    private void handleFear(Mob mob, FearSource fearSource) {
-        if (fearSource == null) return;
+
+    private void handleFear(Mob mob, Player victim, FearSource fearSource) {
+        if (fearSource == null || mob == null) return;
+
+        // Base (forbidden) radius by type
+        double baseRadius;
+        switch (fearSource.type) {
+            case FIRE -> baseRadius = fearFireRadius;
+            case SOUL_TORCH -> baseRadius = fearSoulTorchRadius;
+            case SOUL_LANTERN -> baseRadius = fearSoulLanternRadius;
+            case SOUL_CAMPFIRE -> baseRadius = fearSoulCampfireRadius;
+            default -> baseRadius = 0.0;
+        }
+        if (baseRadius <= 0.0) return;
+
+        // "Perimeter" radius is the forbidden radius + a small buffer to prevent oscillation.
+        double perimeterRadius = baseRadius + Math.max(0.0, fearAvoidPerimeterBuffer);
 
         Location mobLoc = mob.getLocation();
-        Vector away = mobLoc.toVector().subtract(fearSource.location.toVector());
-        if (away.lengthSquared() < 0.0001) away = new Vector(1, 0, 0);
-        away.setY(0).normalize();
+        Location srcLoc = fearSource.location;
 
-        // Move away a few blocks (pathfinding + a small velocity push)
-        Location fleeTarget = mobLoc.clone().add(away.clone().multiply(8));
+        Vector sourceToMob = mobLoc.toVector().subtract(srcLoc.toVector());
+        sourceToMob.setY(0);
+        double dist = sourceToMob.length();
+        if (dist < 0.0001) {
+            sourceToMob = new Vector(1, 0, 0);
+            dist = 1.0;
+        }
+
+        Vector radialOut = sourceToMob.clone().normalize();
+
+        // 1) If inside the perimeter zone: move outward to the edge and STOP there (no big flee impulse).
+        if (dist < perimeterRadius) {
+            Location edgePoint = srcLoc.clone().add(radialOut.clone().multiply(perimeterRadius));
+            edgePoint.setY(mobLoc.getY());
+
+            mob.setTarget(null);
+            mob.getPathfinder().moveTo(edgePoint, getCurrentPathfinderSpeed(mob));
+
+            // Gentle push outward so it doesn't "stick" inside the zone.
+            mob.setVelocity(radialOut.clone().multiply(0.12).setY(0.04));
+            return;
+        }
+
+        // 2) If we're near the perimeter, prefer tangential movement rather than running away.
+        if (victim != null && victim.isOnline() && isSameWorld(mobLoc, victim.getLocation())) {
+            Vector toVictim = victim.getLocation().toVector().subtract(mobLoc.toVector());
+            toVictim.setY(0);
+
+            if (toVictim.lengthSquared() > 0.0001) {
+                Vector desired = toVictim.clone().normalize();
+
+                // If moving toward the victim would move *inward* toward the fear source, slide tangent instead.
+                Vector toSource = srcLoc.toVector().subtract(mobLoc.toVector());
+                toSource.setY(0);
+                if (toSource.lengthSquared() < 0.0001) return;
+                Vector inward = toSource.normalize();
+
+                boolean wouldMoveInward = desired.dot(inward) > fearAvoidInwardDotThreshold;
+
+                Vector stepDir = desired;
+
+                if (wouldMoveInward) {
+                    // Tangent candidates (left/right) around the perimeter
+                    Vector tangent1 = new Vector(-radialOut.getZ(), 0, radialOut.getX());
+                    Vector tangent2 = tangent1.clone().multiply(-1);
+                    stepDir = (tangent1.dot(desired) >= tangent2.dot(desired)) ? tangent1 : tangent2;
+                }
+
+                Location waypoint = mobLoc.clone().add(stepDir.clone().normalize().multiply(fearAvoidStepDistance));
+                waypoint.setY(mobLoc.getY());
+
+                // Ensure we never aim *inside* the perimeter circle.
+                Vector wpFromSource = waypoint.toVector().subtract(srcLoc.toVector());
+                wpFromSource.setY(0);
+                if (wpFromSource.lengthSquared() < perimeterRadius * perimeterRadius) {
+                    Vector corrected = wpFromSource.lengthSquared() < 0.0001 ? radialOut : wpFromSource.normalize();
+                    waypoint = srcLoc.clone().add(corrected.multiply(perimeterRadius));
+                    waypoint.setY(mobLoc.getY());
+                }
+
+                mob.setTarget(null);
+                mob.getPathfinder().moveTo(waypoint, getCurrentPathfinderSpeed(mob));
+                return;
+            }
+        }
+
+        // 3) If we don't have a valid victim context, just hold the perimeter.
+        Location holdPoint = srcLoc.clone().add(radialOut.clone().multiply(perimeterRadius));
+        holdPoint.setY(mobLoc.getY());
         mob.setTarget(null);
-        mob.getPathfinder().moveTo(fleeTarget, getCurrentPathfinderSpeed(mob));
-        mob.setVelocity(away.multiply(0.30).setY(0.05));
+        mob.getPathfinder().moveTo(holdPoint, getCurrentPathfinderSpeed(mob));
     }
+
 
     @EventHandler
     public void onHit(EntityDamageByEntityEvent event) {

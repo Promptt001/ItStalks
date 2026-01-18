@@ -44,7 +44,7 @@ speeds:
 boat_trap_prevention_radius: 2.0
 
 # --- Fears ---
-# The stalker will flee when it detects these blocks nearby.
+# The stalker will avoid entering these radiuses and will try to path around the blocks.
 # Each fear can be toggled and has its own radius.
 fears:
   fire:
@@ -56,9 +56,18 @@ fears:
   soul_lantern:
     enabled: true
     radius: 16.0
-  beacon:
+  soul_campfire:
     enabled: true
     radius: 32.0
+
+  # Fear avoidance tuning (prevents the stalker from repeatedly entering the fear zone and fleeing)
+  # perimeter_buffer: extra distance added on top of each fear radius to create a stable "edge"
+  # step_distance: how far (in blocks) each avoidance step tries to move per pathing update
+  # inward_dot_threshold: how aggressively it switches to tangential movement around the fear zone
+  avoidance:
+    perimeter_buffer: 0.75
+    step_distance: 6.0
+    inward_dot_threshold: 0.15
 
 # --- Chat Messages ---
 # Supports Minecraft color codes using "&".
@@ -95,7 +104,7 @@ proximity_messages:
       message: "&eTip: Fire and soul lights can scare it away."
       cooldown_seconds: 180
     - radius: 15
-      message: "&eTip: Its not far now....only soul light and fire will keep it at bay without a beacon nearby."
+      message: "&eTip: Its not far now....only soul light and fire will keep it at bay without a soul campfire nearby."
       cooldown_seconds: 120
     - radius: 8
       message: "&cIt's very close. RUN."

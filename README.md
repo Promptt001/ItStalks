@@ -16,7 +16,7 @@
   - **Ladder Slider:** Navigates down ladder shafts without getting stuck.
   - **Boat Trap Prevention:** The stalker cannot enter boats and will push away/remove nearby empty boats.
 - **Vex Mode (Anti-Stuck):** If the entity gets stuck or trapped for too long, it transforms into a **Vex** (Ghost). It phases through walls and flies toward the player until it finds safe ground to land and resume walking.
-- **Fears:** The entity can be configured to fear certain light sources/blocks (e.g., fire, soul lights, beacons) and flee when they are nearby.
+- **Fears:** The entity can be configured to fear certain light sources/blocks (e.g., fire, soul lights, soul campfires) and will stop at the perimeter and try to path around them instead of oscillating in and out of the radius.
 
 ### The Curse
 - **The Goal:** Pass the curse to someone else to survive.
@@ -120,9 +120,18 @@ fears:
   soul_lantern:
     enabled: true
     radius: 16.0
-  beacon:
+  soul_campfire:
     enabled: true
     radius: 32.0
+
+  # Fear avoidance tuning (prevents the stalker from repeatedly entering the fear zone and fleeing)
+  # perimeter_buffer: extra distance added on top of each fear radius to create a stable "edge"
+  # step_distance: how far (in blocks) each avoidance step tries to move per pathing update
+  # inward_dot_threshold: how aggressively it switches to tangential movement around the fear zone
+  avoidance:
+    perimeter_buffer: 0.75
+    step_distance: 6.0
+    inward_dot_threshold: 0.15
 ```
 
 ## 🛠️ Building from Source
