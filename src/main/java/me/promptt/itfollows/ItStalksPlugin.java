@@ -69,6 +69,16 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     /** The previous position snapshot used to detect if the stalker isn't moving. */
     private Location lastStalkerPos = null;
 
+    /** Anchor position used to detect being stuck despite jittery micro-movement. */
+    private Location stuckAnchorPos = null;
+
+    /** Orbit state for fear-perimeter navigation (prevents direction flip-jitter). */
+    private Location fearOrbitCenter = null;
+    private int fearOrbitDir = 0;
+    private Location fearOrbitWaypoint = null;
+    private long fearOrbitWaypointSetMs = 0L;
+    private long fearOrbitLockMs = 0L;
+
     /** Seconds counted while the stalker is considered stuck (or intentionally stationary). */
     private int secondsStuck = 0;
 
@@ -475,6 +485,8 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         }
 
         if (victimIsProtected) {
+            // Reset orbit state while we are in full fear-hold mode.
+            clearFearOrbitState();
             holdAtFearPerimeter(mob, victim, victimProtection);
             return;
         } else {
@@ -616,21 +628,34 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         }
 
         // --- Walker stuck logic (Turn into Vex) ---
-        if (lastStalkerPos != null) {
-            Location now = it.getLocation();
-            double movedHoriz = horizontalDistance(now, lastStalkerPos);
-            double movedY = Math.abs(now.getY() - lastStalkerPos.getY());
+        Location now = it.getLocation();
 
-            // Consider "still" as very low horizontal drift and small vertical bob.
-            // This avoids missing stuck events due to tiny perimeter jitter.
-            boolean still = movedHoriz < 0.08 && movedY < 0.25;
-            if (still) {
-                secondsStuck++;
-            } else {
-                secondsStuck = 0;
-            }
+        // Anchor-based stuck detection:
+        // If the mob is jittering in-place (corners, fear perimeter steering, etc.) the
+        // per-second delta can be large enough to prevent stuck-time from accumulating.
+        // Instead, treat it as stuck if it remains within a small area while also having
+        // low horizontal velocity.
+        if (stuckAnchorPos == null) {
+            stuckAnchorPos = now.clone();
         }
-        lastStalkerPos = it.getLocation().clone();
+
+        double anchorHoriz = horizontalDistance(now, stuckAnchorPos);
+        double anchorY = Math.abs(now.getY() - stuckAnchorPos.getY());
+
+        Vector vel = it.getVelocity();
+        double velHoriz = Math.sqrt(vel.getX() * vel.getX() + vel.getZ() * vel.getZ());
+
+        boolean lowSpeed = velHoriz < 0.13;
+        boolean nearAnchor = anchorHoriz < 0.85 && anchorY < 1.35;
+
+        if (nearAnchor && lowSpeed) {
+            secondsStuck++;
+        } else {
+            secondsStuck = 0;
+            stuckAnchorPos = now.clone();
+        }
+
+        lastStalkerPos = now.clone();
 
         if (secondsStuck >= vexTriggerSeconds) {
             // While the victim remains protected, only allow ONE Vex morph to avoid
@@ -720,6 +745,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         isVexMode = (type == EntityType.VEX);
         secondsStuck = 0;
         lastStalkerPos = spawnLoc.clone();
+        stuckAnchorPos = spawnLoc.clone();
         if (isVexMode) secondsInVexMode = 0;
 
         // Configure stats
@@ -1201,9 +1227,13 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         final boolean canFly = (mob instanceof Vex) || isVexMode;
 
-        // 0) Always push out if the stalker is inside the perimeter sphere.
+        // 0) If the stalker is DEEP inside the perimeter sphere, push it outward immediately.
+        //    If it is only barely inside (common at the exact edge due to path rounding),
+        //    do NOT override movement here — letting the perimeter-walk/orbit logic run
+        //    prevents the classic edge-jitter behavior.
         double mobDist = mobLoc.distance(srcLoc);
-        if (mobDist < perimeterRadius) {
+        double innerRadius = Math.max(0.0, perimeterRadius - 0.55);
+        if (mobDist < innerRadius) {
             // Even for Vex forms, keep fear-edge waypoints on the current Y-slice.
             // This prevents "upper hemisphere" target selection which can look like
             // the stalker is stuck hovering above the perimeter.
@@ -1216,8 +1246,10 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             if (!canFly) out.setY(0);
             if (out.lengthSquared() < 0.0001) out = new Vector(1, 0, 0);
             out.normalize();
-            mob.setVelocity(out.multiply(0.12).setY(0.04));
+            mob.setVelocity(out.multiply(0.14).setY(0.04));
 
+            // Reset orbit state — we are not orbiting, we are ejecting.
+            clearFearOrbitState();
             return true;
         }
 
@@ -1247,19 +1279,50 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
                 ? segmentIntersectsSphere(mobLoc, victimLoc, srcLoc, perimeterRadius)
                 : segmentIntersectsCircleXZ(mobLoc, victimLoc, srcLoc, perimeterRadius);
         if (blocked) {
-            // IMPORTANT:
-            // Even in Vex mode we do NOT want to "phase" through the safety bubble by flying over it.
-            // That defeats the purpose of the fear zone and looks unfair.
-            //
-            // Instead we path *around the perimeter* for both walkers and fliers. (Vex can still benefit
-            // from collision-free navigation, but it must respect the bubble as a no-entry volume.)
-            Location around = stepAlongPerimeterTowardsVictim(srcLoc, mobLoc, victimLoc, perimeterRadius);
-            mob.setTarget(null);
-            mob.getPathfinder().moveTo(around, getCurrentPathfinderSpeed(mob));
+            long nowMs = System.currentTimeMillis();
 
+            // Lock orbit state to avoid CW/CCW flip-flopping every tick (which produces jitter).
+            if (fearOrbitCenter == null
+                    || !isSameWorld(fearOrbitCenter, srcLoc)
+                    || fearOrbitCenter.distance(srcLoc) > 1.2) {
+                fearOrbitCenter = srcLoc.clone();
+                fearOrbitDir = 0;
+                fearOrbitWaypoint = null;
+                fearOrbitWaypointSetMs = 0L;
+                fearOrbitLockMs = 0L;
+            }
+
+            // Choose an orbit direction once, then keep it for a few seconds.
+            double ax = mobLoc.getX() - srcLoc.getX();
+            double az = mobLoc.getZ() - srcLoc.getZ();
+            double bx = victimLoc.getX() - srcLoc.getX();
+            double bz = victimLoc.getZ() - srcLoc.getZ();
+            double thetaMob = Math.atan2(az, ax);
+            double thetaVictim = Math.atan2(bz, bx);
+            double delta = wrapRadians(thetaVictim - thetaMob);
+            int desiredDir = (delta >= 0) ? 1 : -1;
+
+            if (fearOrbitDir == 0 || (nowMs - fearOrbitLockMs) > 3000L) {
+                fearOrbitDir = desiredDir;
+                fearOrbitLockMs = nowMs;
+            }
+
+            // Commit to the same waypoint until we reach it (or a short timeout elapses).
+            if (fearOrbitWaypoint == null
+                    || !isSameWorld(fearOrbitWaypoint, mobLoc)
+                    || mobLoc.distance(fearOrbitWaypoint) < 1.25
+                    || (nowMs - fearOrbitWaypointSetMs) > 2000L) {
+                fearOrbitWaypoint = stepAlongPerimeterTowardsVictim(srcLoc, mobLoc, victimLoc, perimeterRadius, fearOrbitDir);
+                fearOrbitWaypointSetMs = nowMs;
+            }
+
+            mob.setTarget(null);
+            mob.getPathfinder().moveTo(fearOrbitWaypoint, getCurrentPathfinderSpeed(mob));
             return true;
         }
 
+        // No longer orbiting / avoiding — clear orbit state.
+        clearFearOrbitState();
         return false;
     }
 
@@ -1368,7 +1431,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
      * This does not try to perfectly solve shortest-path around a circle; it is an intentional
      * "committed" stepping approach that is stable and avoids constant jitter.
      */
-    private Location stepAlongPerimeterTowardsVictim(Location center, Location mobLoc, Location victimLoc, double perimeterRadius) {
+    private Location stepAlongPerimeterTowardsVictim(Location center, Location mobLoc, Location victimLoc, double perimeterRadius, int orbitDir) {
         // Walkers move around the sphere on the current Y slice.
         double dy = mobLoc.getY() - center.getY();
         double sliceR2 = (perimeterRadius * perimeterRadius) - (dy * dy);
@@ -1377,8 +1440,8 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         // If the slice is effectively a point (near the top/bottom), fall back to a minimal circle.
         if (sliceRadius < 0.5) sliceRadius = Math.max(0.5, perimeterRadius * 0.35);
 
-        // Stay slightly OUTSIDE the exact perimeter to reduce "bouncing" on the edge.
-        sliceRadius += Math.max(0.25, fearAvoidPerimeterBuffer * 0.35);
+        // Stay meaningfully OUTSIDE the exact perimeter to reduce edge-bounce jitter.
+        sliceRadius += Math.max(0.75, fearAvoidPerimeterBuffer * 0.50);
 
         double ax = mobLoc.getX() - center.getX();
         double az = mobLoc.getZ() - center.getZ();
@@ -1390,12 +1453,12 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         double thetaVictim = Math.atan2(bz, bx);
 
         double delta = wrapRadians(thetaVictim - thetaMob);
-        double dir = (delta >= 0) ? 1.0 : -1.0; // ccw if positive, cw if negative
+        double dir = (orbitDir != 0) ? orbitDir : ((delta >= 0) ? 1.0 : -1.0);
 
         // Convert configured step distance (blocks) to an angular step.
         // Clamp to avoid huge jumps on small radiuses and tiny jitter on large radiuses.
         double stepAngle = fearAvoidStepDistance / Math.max(1.0, sliceRadius);
-        stepAngle = clamp(stepAngle, 0.02, 0.45);
+        stepAngle = clamp(stepAngle, 0.05, 0.55);
 
         double nextTheta = thetaMob + dir * stepAngle;
 
@@ -1532,6 +1595,15 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
     private double clamp(double v, double min, double max) {
         return Math.max(min, Math.min(max, v));
+    }
+
+
+    private void clearFearOrbitState() {
+        fearOrbitCenter = null;
+        fearOrbitDir = 0;
+        fearOrbitWaypoint = null;
+        fearOrbitWaypointSetMs = 0L;
+        fearOrbitLockMs = 0L;
     }
 
     // --- Events (Curse Transfer / Safety) ---
