@@ -61,6 +61,10 @@ fears:
     radius: 32.0
 
   # Fear avoidance tuning (prevents the stalker from repeatedly entering the fear zone and fleeing)
+  # Behaviour notes:
+  #  - If the cursed player is INSIDE the fear radius, the stalker will stand still at the edge.
+  #  - If the cursed player is OUTSIDE the radius but the fear zone blocks the direct path,
+  #    the stalker will step around the perimeter until it has a clear route.
   # perimeter_buffer: extra distance added on top of each fear radius to create a stable "edge"
   # step_distance: how far (in blocks) each avoidance step tries to move per pathing update
   # inward_dot_threshold: how aggressively it switches to tangential movement around the fear zone
@@ -72,7 +76,7 @@ fears:
 # --- Chat Messages ---
 # Supports Minecraft color codes using "&".
 # Placeholders:
-#  - {victim}, {target}, {seconds}
+  #  - {victim}, {target}, {seconds}
 messages:
   curse_assigned: "&4&lYou feel a cold chill... It is following you."
   curse_cooldown: "&cYou cannot pass the curse yet! Wait {seconds}s."
@@ -86,8 +90,8 @@ messages:
 # These are optional chat messages that trigger as the stalker gets close.
 # Supports color codes using "&".
 # Placeholders:
-#  - {distance} = current stalker distance to the cursed player
-#  - {radius}   = the tier radius that triggered
+  #  - {distance} = current stalker distance to the cursed player
+  #  - {radius}   = the tier radius that triggered
 proximity_messages:
   enabled: true
   # How often to check distance for proximity messages
