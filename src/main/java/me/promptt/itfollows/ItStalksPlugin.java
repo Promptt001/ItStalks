@@ -82,6 +82,23 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     private boolean fearBeaconEnabled;
     private double fearBeaconRadius;
 
+    // Chat Messages
+    private String msgCurseAssigned;
+    private String msgCurseCooldown;
+    private String msgCursePassedAttacker;
+    private String msgCursePassedVictim;
+    private String msgPlayerNotFound;
+    private String msgCurseStartedAdmin;
+    private String msgConfigReloaded;
+
+    // Proximity Messages / Tips
+    private boolean proximityMessagesEnabled;
+    private int proximityCheckIntervalTicks;
+    private int proximityDefaultCooldownSeconds;
+    private List<ProximityTier> proximityTiers = new ArrayList<>();
+    private int proximityTickCounter = 0;
+    private final Map<UUID, Map<Integer, Long>> lastProximityMessageMs = new HashMap<>();
+
     private FearSource cachedFearSource;
     private long lastFearScanMs = 0;
 
@@ -101,6 +118,18 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         FearSource(FearType type, Location location) {
             this.type = type;
             this.location = location;
+        }
+    }
+
+    private static class ProximityTier {
+        final double radius;
+        final String message;
+        final int cooldownSeconds;
+
+        ProximityTier(double radius, String message, int cooldownSeconds) {
+            this.radius = radius;
+            this.message = message;
+            this.cooldownSeconds = cooldownSeconds;
         }
     }
 
@@ -188,6 +217,38 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         fearBeaconEnabled = config.getBoolean("fears.beacon.enabled", true);
         fearBeaconRadius = config.getDouble("fears.beacon.radius", 16.0);
 
+        // Messages (supports color codes with & and placeholders like {victim}, {seconds}, etc.)
+        msgCurseAssigned = config.getString("messages.curse_assigned", "&4&lYou feel a cold chill... It is following you.");
+        msgCurseCooldown = config.getString("messages.curse_cooldown", "&cYou cannot pass the curse yet! Wait {seconds}s.");
+        msgCursePassedAttacker = config.getString("messages.curse_passed_attacker", "&aYou have passed the curse to {victim}!");
+        msgCursePassedVictim = config.getString("messages.curse_passed_victim", "&4&lTAG! You are now Cursed.");
+        msgPlayerNotFound = config.getString("messages.player_not_found", "&cPlayer not found.");
+        msgCurseStartedAdmin = config.getString("messages.curse_started_admin", "&cCurse started on {target}");
+        msgConfigReloaded = config.getString("messages.config_reloaded", "&aItStalks configuration reloaded!");
+
+        // Proximity message tiers (used for tips/warnings as the stalker approaches)
+        proximityMessagesEnabled = config.getBoolean("proximity_messages.enabled", true);
+        proximityCheckIntervalTicks = Math.max(5, config.getInt("proximity_messages.check_interval_ticks", 20));
+        proximityDefaultCooldownSeconds = Math.max(0, config.getInt("proximity_messages.default_cooldown_seconds", 180));
+        proximityTiers.clear();
+        List<Map<?, ?>> tiers = config.getMapList("proximity_messages.tiers");
+        for (Map<?, ?> m : tiers) {
+            if (m == null) continue;
+            double radius = toDouble(m.get("radius"), -1);
+            if (radius <= 0) continue;
+            Object msgObj = m.get("message");
+            if (msgObj == null) continue;
+            String message = String.valueOf(msgObj);
+            int cooldown = proximityDefaultCooldownSeconds;
+            if (m.containsKey("cooldown_seconds")) {
+                cooldown = (int) Math.round(toDouble(m.get("cooldown_seconds"), cooldown));
+            }
+            proximityTiers.add(new ProximityTier(radius, message, cooldown));
+        }
+        proximityTiers.sort(Comparator.comparingDouble(t -> t.radius));
+        lastProximityMessageMs.clear();
+        proximityTickCounter = 0;
+
         allowedForms.clear();
         for (String s : config.getStringList("allowed_forms")) {
             try {
@@ -195,6 +256,32 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             } catch (IllegalArgumentException e) {
                 getLogger().warning("Invalid entity type in config: " + s);
             }
+        }
+    }
+
+
+    private String colorize(String msg) {
+        if (msg == null) return "";
+        return ChatColor.translateAlternateColorCodes('&', msg);
+    }
+
+    private String formatMessage(String template, Map<String, String> placeholders) {
+        if (template == null) return "";
+        String out = template;
+        if (placeholders != null) {
+            for (Map.Entry<String, String> e : placeholders.entrySet()) {
+                out = out.replace("{" + e.getKey() + "}", e.getValue());
+            }
+        }
+        return colorize(out);
+    }
+
+    private static double toDouble(Object o, double def) {
+        if (o instanceof Number n) return n.doubleValue();
+        try {
+            return Double.parseDouble(String.valueOf(o));
+        } catch (Exception ignored) {
+            return def;
         }
     }
 
@@ -245,6 +332,9 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         // Behavior
         if (it instanceof Mob mob) {
             double distToVictim = safeDistance(mob.getLocation(), victim.getLocation());
+
+            // Proximity chat messages (tips/alerts based on distance)
+            handleProximityMessages(victim, distToVictim);
 
             // Visibility
             for (Player p : Bukkit.getOnlinePlayers()) {
@@ -302,6 +392,41 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         if (safeDistance(it.getLocation(), victim.getLocation()) <= fatigueRange) {
             victim.addPotionEffect(new PotionEffect(PotionEffectType.MINING_FATIGUE, 100, 1, false, false));
         }
+    }
+
+    private void handleProximityMessages(Player victim, double distToVictim) {
+        if (!proximityMessagesEnabled || proximityTiers.isEmpty() || victim == null) return;
+
+        // tickLogic runs every 5 ticks; use an interval counter to reduce spam
+        proximityTickCounter += 5;
+        if (proximityTickCounter < proximityCheckIntervalTicks) return;
+        proximityTickCounter = 0;
+
+        // Choose the closest matching tier (smallest radius that the stalker is currently within)
+        ProximityTier chosen = null;
+        int chosenIndex = -1;
+        for (int i = 0; i < proximityTiers.size(); i++) {
+            ProximityTier tier = proximityTiers.get(i);
+            if (distToVictim <= tier.radius) {
+                chosen = tier;
+                chosenIndex = i;
+                break;
+            }
+        }
+        if (chosen == null) return;
+
+        long now = System.currentTimeMillis();
+        long cooldownMs = Math.max(0, chosen.cooldownSeconds) * 1000L;
+
+        Map<Integer, Long> perTier = lastProximityMessageMs.computeIfAbsent(victim.getUniqueId(), k -> new HashMap<>());
+        long lastSent = perTier.getOrDefault(chosenIndex, 0L);
+        if (cooldownMs > 0 && (now - lastSent) < cooldownMs) return;
+
+        String distStr = String.format(Locale.US, "%.1f", distToVictim);
+        String radiusStr = String.format(Locale.US, "%.1f", chosen.radius);
+
+        victim.sendMessage(formatMessage(chosen.message, Map.of("distance", distStr, "radius", radiusStr)));
+        perTier.put(chosenIndex, now);
     }
 
     private void checkStuckStatus() {
@@ -458,7 +583,7 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
     private void setCursedPlayer(Player player) {
         this.cursedPlayerUUID = player.getUniqueId();
-        player.sendMessage(ChatColor.DARK_RED + "" + ChatColor.BOLD + "You feel a cold chill... It is following you.");
+        player.sendMessage(formatMessage(msgCurseAssigned, null));
         removeItEntity();
     }
 
@@ -682,15 +807,15 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             long cooldownMs = transferCooldownSeconds * 1000L;
             if (System.currentTimeMillis() - lastTransferTime < cooldownMs) {
                 long timeLeft = (cooldownMs - (System.currentTimeMillis() - lastTransferTime)) / 1000;
-                attacker.sendMessage(ChatColor.RED + "You cannot pass the curse yet! Wait " + timeLeft + "s.");
+                attacker.sendMessage(formatMessage(msgCurseCooldown, Map.of("seconds", String.valueOf(timeLeft))));
                 return;
             }
 
             setCursedPlayer(victim);
             lastTransferTime = System.currentTimeMillis();
             
-            attacker.sendMessage(ChatColor.GREEN + "You have passed the curse to " + victim.getName() + "!");
-            victim.sendMessage(ChatColor.DARK_RED + "" + ChatColor.BOLD + "TAG! You are now Cursed.");
+            attacker.sendMessage(formatMessage(msgCursePassedAttacker, Map.of("victim", victim.getName())));
+            victim.sendMessage(formatMessage(msgCursePassedVictim, null));
         }
     }
 
@@ -731,17 +856,17 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
             if (args.length != 1) return false;
             Player target = Bukkit.getPlayer(args[0]);
             if (target == null) {
-                sender.sendMessage(ChatColor.RED + "Player not found.");
+                sender.sendMessage(formatMessage(msgPlayerNotFound, null));
                 return true;
             }
             setCursedPlayer(target);
-            sender.sendMessage(ChatColor.RED + "Curse started on " + target.getName());
+            sender.sendMessage(formatMessage(msgCurseStartedAdmin, Map.of("target", target.getName())));
             return true;
         }
         else if (command.getName().equalsIgnoreCase("cursereload")) {
             reloadConfig();
             loadConfig();
-            sender.sendMessage(ChatColor.GREEN + "ItStalks configuration reloaded!");
+            sender.sendMessage(formatMessage(msgConfigReloaded, null));
             return true;
         }
         return false;

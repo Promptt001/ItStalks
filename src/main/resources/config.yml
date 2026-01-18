@@ -38,12 +38,14 @@ speeds:
     pathfinder: 1.0
 
 # --- Boat Trap Prevention ---
+# The stalker can no longer enter boats.
 # If a boat is within this radius of the stalker, it will be removed (unless a player is riding it)
 # and the stalker will be pushed away. Set to 0 to disable.
 boat_trap_prevention_radius: 3.5
 
 # --- Fears ---
 # The stalker will flee when it detects these blocks nearby.
+# Each fear can be toggled and has its own radius.
 fears:
   fire:
     enabled: true
@@ -57,6 +59,47 @@ fears:
   beacon:
     enabled: true
     radius: 16.0
+
+# --- Chat Messages ---
+# Supports Minecraft color codes using "&".
+# Placeholders:
+#  - {victim}, {target}, {seconds}
+messages:
+  curse_assigned: "&4&lYou feel a cold chill... It is following you."
+  curse_cooldown: "&cYou cannot pass the curse yet! Wait {seconds}s."
+  curse_passed_attacker: "&aYou have passed the curse to {victim}!"
+  curse_passed_victim: "&4&lTAG! You are now Cursed."
+  player_not_found: "&cPlayer not found."
+  curse_started_admin: "&cCurse started on {target}"
+  config_reloaded: "&aItStalks configuration reloaded!"
+
+# --- Proximity Messages (Tips / Alerts) ---
+# These are optional chat messages that trigger as the stalker gets close.
+# Supports color codes using "&".
+# Placeholders:
+#  - {distance} = current stalker distance to the cursed player
+#  - {radius}   = the tier radius that triggered
+proximity_messages:
+  enabled: true
+  # How often to check distance for proximity messages
+  check_interval_ticks: 20
+  # Cooldown applied if a tier does not specify its own cooldown_seconds
+  default_cooldown_seconds: 180
+  # Add/remove tiers freely.
+  # The plugin automatically picks the closest matching tier (smallest radius that the stalker is within).
+  tiers:
+    - radius: 60
+      message: "&7You feel like you're being watched..."
+      cooldown_seconds: 300
+    - radius: 30
+      message: "&eTip: Stay in well-lit areas."
+      cooldown_seconds: 180
+    - radius: 15
+      message: "&eTip: Fire and soul lights can scare it away."
+      cooldown_seconds: 120
+    - radius: 8
+      message: "&cIt's very close. RUN."
+      cooldown_seconds: 60
 
 # Allowed forms for "It" (Standard walking forms)
 allowed_forms:
