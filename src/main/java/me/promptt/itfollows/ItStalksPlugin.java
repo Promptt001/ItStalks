@@ -150,6 +150,13 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     private FearSource cachedFearSource;
     private long lastFearScanMs = 0;
 
+    // Cached victim-protection scan (fear sources around the cursed player)
+    private FearSource cachedVictimProtectionSource;
+    private long lastVictimProtectionScanMs = 0;
+
+    /** True while the cursed player is inside a fear "safe zone". */
+    private volatile boolean victimProtectedByFear = false;
+
     // Allowed entity forms for the stalker while walking
     private final List<EntityType> allowedForms = new ArrayList<>();
 
@@ -367,6 +374,9 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
      *  - Handle combat effects
      */
     private void tickLogic() {
+        // Reset per-tick protection flag. It will be re-enabled if the victim is in a safety radius.
+        victimProtectedByFear = false;
+
         // 1) Ensure a valid cursed player exists (or auto-pick)
         if (cursedPlayerUUID == null) {
             if (autoCurseIfEmpty) pickRandomTarget();
@@ -434,16 +444,35 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         // Prevent boat trapping / clean nearby boats
         handleBoatTrapPrevention(mob);
 
+        // --- Safety Radius (Feared Objects) ---
+        // If the cursed player is standing inside the safety radius of any fear source,
+        // the stalker should freeze in place (no movement, no turning into a Vex, no attacks).
+        // This is intentionally stronger than simple "edge holding" and fixes the unwanted
+        // perimeter-orbit behavior.
+        FearSource victimProtection = getVictimProtectionSource(victim.getLocation());
+        boolean victimIsProtected = victimProtection != null;
+        victimProtectedByFear = victimIsProtected;
+
+        if (victimIsProtected) {
+            freezeStalkerInPlace(mob);
+            return;
+        } else {
+            // Ensure AI is re-enabled when the victim leaves the safety radius.
+            if (!mob.hasAI()) {
+                mob.setAI(true);
+            }
+        }
+
         // Fear logic: certain blocks repel the stalker.
-        // IMPORTANT CHANGE:
-        //  - The stalker no longer constantly "orbits" the fear perimeter.
-        //  - If the victim is inside the fear radius, the stalker holds still at the edge.
-        //  - If the victim is outside but the fear zone blocks the direct path, the stalker will
-        //    take committed steps around the perimeter until it has a clear route.
+        // Updated behavior:
+        //  - If the cursed player is inside any safety radius, the stalker freezes in place.
+        //  - Otherwise, feared objects behave as *spherical* no-entry zones:
+        //      * walkers step around the perimeter
+        //      * Vex (flying) forms can route above the sphere
         FearSource fearSource = getFearSource(mob.getLocation());
 
         boolean fearOverrodeMovement = false;
-        if (fearSource != null && !isVexMode) {
+        if (fearSource != null) {
             fearOverrodeMovement = handleFear(mob, victim, fearSource);
         }
 
@@ -538,6 +567,13 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
      */
     private void checkStuckStatus() {
         if (!vexModeEnabled || itEntityUUID == null) return;
+
+        // If the cursed player is in a safety radius, the stalker is intentionally frozen.
+        // Do not treat this as "stuck" and never morph into a Vex in this state.
+        if (victimProtectedByFear && !isVexMode) {
+            secondsStuck = 0;
+            return;
+        }
 
         Entity it = Bukkit.getEntity(itEntityUUID);
         if (it == null || !it.isValid()) return;
@@ -806,6 +842,32 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         return allowedFormsPathfinderSpeed;
     }
 
+    /**
+     * Hard-freezes the stalker in place.
+     *
+     * Used when the cursed player is inside a fear-source safety radius.
+     * This ensures the entity does not "orbit" the perimeter, does not attack,
+     * and does not trigger Vex anti-stuck morphing.
+     */
+    private void freezeStalkerInPlace(Mob mob) {
+        if (mob == null) return;
+
+        // Stop any current navigation request.
+        mob.setTarget(null);
+        mob.getPathfinder().moveTo(mob.getLocation(), 0.0);
+
+        // Zero out motion.
+        mob.setVelocity(new Vector(0, 0, 0));
+        mob.setFallDistance(0);
+
+        // Disable AI to prevent idle turning/wandering.
+        mob.setAI(false);
+
+        // Ensure anti-stuck logic does not consider this a "stuck" scenario.
+        secondsStuck = 0;
+        lastStalkerPos = mob.getLocation().clone();
+    }
+
     // --- Boat Trap Prevention ---
 
     /**
@@ -860,6 +922,97 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         lastFearScanMs = now;
         cachedFearSource = scanForFearSource(center);
         return cachedFearSource;
+    }
+
+    /**
+     * Returns a fear source that is actively protecting the cursed player
+     * (i.e., the player is inside that fear source's BASE radius).
+     *
+     * This is separate from {@link #getFearSource(Location)} because we need
+     * "player safety bubble" behavior even when the stalker is far away.
+     */
+    private FearSource getVictimProtectionSource(Location victimCenter) {
+        long now = System.currentTimeMillis();
+        if (now - lastVictimProtectionScanMs < 750) {
+            return cachedVictimProtectionSource;
+        }
+        lastVictimProtectionScanMs = now;
+        cachedVictimProtectionSource = scanForProtectingFearSource(victimCenter);
+        return cachedVictimProtectionSource;
+    }
+
+    /**
+     * Full scan around the player for fear sources where the player is WITHIN the BASE radius.
+     *
+     * This directly supports the behavior:
+     *  - While the player is inside the safety radius, the stalker freezes in place.
+     */
+    private FearSource scanForProtectingFearSource(Location center) {
+        if (center == null || center.getWorld() == null) return null;
+
+        double maxRadius = 0.0;
+        if (fearFireEnabled && fearFireRadius > 0) maxRadius = Math.max(maxRadius, fearFireRadius);
+        if (fearSoulTorchEnabled && fearSoulTorchRadius > 0) maxRadius = Math.max(maxRadius, fearSoulTorchRadius);
+        if (fearSoulLanternEnabled && fearSoulLanternRadius > 0) maxRadius = Math.max(maxRadius, fearSoulLanternRadius);
+        if (fearSoulCampfireEnabled && fearSoulCampfireRadius > 0) maxRadius = Math.max(maxRadius, fearSoulCampfireRadius);
+        if (maxRadius <= 0) return null;
+
+        int r = (int) Math.ceil(maxRadius);
+        int cx = center.getBlockX();
+        int cy = center.getBlockY();
+        int cz = center.getBlockZ();
+
+        FearSource best = null;
+        double bestDist2 = Double.MAX_VALUE;
+
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    int x = cx + dx;
+                    int y = cy + dy;
+                    int z = cz + dz;
+
+                    Block block = center.getWorld().getBlockAt(x, y, z);
+                    Material type = block.getType();
+
+                    FearType fearType = null;
+                    double radius = 0.0;
+
+                    // Fire / Soul Fire
+                    if (fearFireEnabled && fearFireRadius > 0 && (type == Material.FIRE || type == Material.SOUL_FIRE)) {
+                        fearType = FearType.FIRE;
+                        radius = fearFireRadius;
+                    }
+                    // Soul Torch
+                    else if (fearSoulTorchEnabled && fearSoulTorchRadius > 0 && (type == Material.SOUL_TORCH || type == Material.SOUL_WALL_TORCH)) {
+                        fearType = FearType.SOUL_TORCH;
+                        radius = fearSoulTorchRadius;
+                    }
+                    // Soul Lantern
+                    else if (fearSoulLanternEnabled && fearSoulLanternRadius > 0 && type == Material.SOUL_LANTERN) {
+                        fearType = FearType.SOUL_LANTERN;
+                        radius = fearSoulLanternRadius;
+                    }
+                    // Soul Campfire
+                    else if (fearSoulCampfireEnabled && fearSoulCampfireRadius > 0 && type == Material.SOUL_CAMPFIRE) {
+                        fearType = FearType.SOUL_CAMPFIRE;
+                        radius = fearSoulCampfireRadius;
+                    }
+
+                    if (fearType == null) continue;
+
+                    double dist2 = dx * dx + dy * dy + dz * dz;
+                    if (dist2 > radius * radius) continue;
+
+                    if (dist2 < bestDist2) {
+                        bestDist2 = dist2;
+                        best = new FearSource(fearType, block.getLocation().add(0.5, 0.5, 0.5));
+                    }
+                }
+            }
+        }
+
+        return best;
     }
 
     /**
@@ -940,10 +1093,12 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     /**
      * Fear avoidance update.
      *
-     * IMPORTANT CHANGE (per request):
-     *  - The stalker will stand still at the perimeter when the victim is inside the fear radius.
-     *  - If the victim is outside the radius but the fear zone is "between" the stalker and victim,
-     *    the stalker commits to stepping around the perimeter until the direct route clears.
+     * Desired behavior:
+     *  - Fear zones are treated as spherical volumes.
+     *  - If the cursed player is inside a fear zone, the stalker freezes entirely
+     *    (handled earlier in tickLogic via {@link #getVictimProtectionSource(Location)}).
+     *  - If the player is outside, the stalker will avoid entering the sphere and will
+     *    navigate around it. If the stalker is a Vex (flying), it can route "over" the sphere.
      *
      * @return true if fear logic set the movement for this tick (skip normal chase)
      */
@@ -960,16 +1115,20 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
         Location srcLoc = fearSource.location;
         if (!isSameWorld(mobLoc, srcLoc)) return false;
 
-        // 0) Always push out if the stalker is inside the perimeter.
-        double mobDist = horizontalDistance(mobLoc, srcLoc);
+        final boolean canFly = (mob instanceof Vex) || isVexMode;
+
+        // 0) Always push out if the stalker is inside the perimeter sphere.
+        double mobDist = mobLoc.distance(srcLoc);
         if (mobDist < perimeterRadius) {
-            Location edgePoint = perimeterPoint(srcLoc, mobLoc, perimeterRadius, mobLoc.getY());
+            Location edgePoint = canFly
+                    ? perimeterPointOnSphere(srcLoc, mobLoc, perimeterRadius)
+                    : perimeterPoint(srcLoc, mobLoc, perimeterRadius, mobLoc.getY());
             mob.setTarget(null);
             mob.getPathfinder().moveTo(edgePoint, getCurrentPathfinderSpeed(mob));
 
             // A small outward nudge prevents getting "stuck" inside the zone.
             Vector out = mobLoc.toVector().subtract(srcLoc.toVector());
-            out.setY(0);
+            if (!canFly) out.setY(0);
             if (out.lengthSquared() < 0.0001) out = new Vector(1, 0, 0);
             out.normalize();
             mob.setVelocity(out.multiply(0.12).setY(0.04));
@@ -978,7 +1137,9 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         // If we do not have a valid victim context, just hold the perimeter.
         if (victim == null || !victim.isOnline() || !isSameWorld(srcLoc, victim.getLocation())) {
-            Location hold = perimeterPoint(srcLoc, mobLoc, perimeterRadius, mobLoc.getY());
+            Location hold = canFly
+                    ? perimeterPointOnSphere(srcLoc, mobLoc, perimeterRadius)
+                    : perimeterPoint(srcLoc, mobLoc, perimeterRadius, mobLoc.getY());
             mob.setTarget(null);
             mob.getPathfinder().moveTo(hold, getCurrentPathfinderSpeed(mob));
             return true;
@@ -986,30 +1147,26 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         Location victimLoc = victim.getLocation();
 
-        // 1) If the victim is inside the BASE fear radius, hold still at the edge.
-        //    This prevents the undesirable "orbiting" behavior while the player is protected.
-        double victimDist = horizontalDistance(victimLoc, srcLoc);
+        // 1) If the victim is inside the BASE fear radius, freeze completely.
+        //    (This should already be handled by tickLogic, but keep it here for robustness.)
+        double victimDist = victimLoc.distance(srcLoc);
         if (victimDist < baseRadius) {
-            // Player is actively protected by the fear source.
-            // Hold still at the perimeter (do NOT orbit / track around the edge).
-            Location holdEdge = perimeterPoint(srcLoc, mobLoc, perimeterRadius, mobLoc.getY());
-            mob.setTarget(null);
-            mob.getPathfinder().moveTo(holdEdge, getCurrentPathfinderSpeed(mob));
-
-            // Reduce jitter when already "at" the edge.
-            if (mobLoc.distanceSquared(holdEdge) < 0.5 * 0.5) {
-                mob.setVelocity(new Vector(0, 0, 0));
-            }
-
+            freezeStalkerInPlace(mob);
             return true;
         }
 
         // 2) Victim is NOT protected by the fear radius.
         //    If the fear zone blocks the direct route, path around the perimeter.
         //    Otherwise, allow the normal chase logic to execute.
-        boolean blocked = segmentIntersectsCircle2D(mobLoc, victimLoc, srcLoc, perimeterRadius);
+        boolean blocked = segmentIntersectsSphere(mobLoc, victimLoc, srcLoc, perimeterRadius);
         if (blocked) {
-            Location around = stepAlongPerimeterTowardsVictim(srcLoc, mobLoc, victimLoc, perimeterRadius);
+            Location around;
+            if (canFly) {
+                // Flying forms can route above the sphere.
+                around = flyOverSphereWaypoint(srcLoc, perimeterRadius, victimLoc);
+            } else {
+                around = stepAlongPerimeterTowardsVictim(srcLoc, mobLoc, victimLoc, perimeterRadius);
+            }
             mob.setTarget(null);
             mob.getPathfinder().moveTo(around, getCurrentPathfinderSpeed(mob));
             return true;
@@ -1028,13 +1185,21 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     }
 
     /**
-     * Computes a stable point on the perimeter circle (XZ plane) in the direction of {@code toward}.
+     * Computes a stable point on the SURFACE of a spherical fear zone at the requested Y level.
+     *
+     * For walkers we keep path requests on the ground-plane (constant Y) to avoid asking the
+     * navigator to move to mid-air points.
      */
-    private Location perimeterPoint(Location center, Location toward, double radius, double y) {
+    private Location perimeterPoint(Location center, Location toward, double sphereRadius, double y) {
+        // Compute the sphere slice radius at this Y: r_slice = sqrt(R^2 - dy^2)
+        double dy = y - center.getY();
+        double r2 = (sphereRadius * sphereRadius) - (dy * dy);
+        double sliceRadius = (r2 > 0) ? Math.sqrt(r2) : 0.0;
+
         Vector dir = toward.toVector().subtract(center.toVector());
         dir.setY(0);
         if (dir.lengthSquared() < 0.0001) dir = new Vector(1, 0, 0);
-        dir.normalize().multiply(radius);
+        dir.normalize().multiply(sliceRadius);
 
         Location out = center.clone().add(dir);
         out.setY(y);
@@ -1042,9 +1207,17 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     }
 
     /**
-     * Horizontal (XZ) distance between two locations.
-     * The fear avoidance is modeled as a cylinder for walkers.
+     * Computes a point on the surface of a spherical fear zone in full 3D.
+     * Used by flying forms (Vex) to avoid the zone without flattening to XZ.
      */
+    private Location perimeterPointOnSphere(Location center, Location toward, double sphereRadius) {
+        Vector dir = toward.toVector().subtract(center.toVector());
+        if (dir.lengthSquared() < 0.0001) dir = new Vector(1, 0, 0);
+        dir.normalize().multiply(sphereRadius);
+        return center.clone().add(dir);
+    }
+
+    /** Horizontal (XZ) distance between two locations. */
     private double horizontalDistance(Location a, Location b) {
         double dx = a.getX() - b.getX();
         double dz = a.getZ() - b.getZ();
@@ -1052,44 +1225,53 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
     }
 
     /**
-     * Checks if the segment from start -> end intersects the interior of a circle in the XZ plane.
+     * Checks if the segment from start -> end intersects the interior of a sphere.
      *
-     * This is used to decide when the stalker must path around the fear radius ("player on the other side").
+     * This is used to decide when the stalker must path around a spherical fear zone
+     * ("player on the other side").
      */
-    private boolean segmentIntersectsCircle2D(Location start, Location end, Location center, double radius) {
+    private boolean segmentIntersectsSphere(Location start, Location end, Location center, double radius) {
         if (!isSameWorld(start, end) || !isSameWorld(start, center)) return false;
 
-        // Translate to circle-at-origin coordinates
+        // Translate so the sphere is at the origin.
         double ax = start.getX() - center.getX();
+        double ay = start.getY() - center.getY();
         double az = start.getZ() - center.getZ();
+
         double bx = end.getX() - center.getX();
+        double by = end.getY() - center.getY();
         double bz = end.getZ() - center.getZ();
 
         double dx = bx - ax;
+        double dy = by - ay;
         double dz = bz - az;
 
         double r2 = radius * radius;
 
-        // If either endpoint is inside the circle, treat as intersecting.
-        if ((ax * ax + az * az) < r2) return true;
-        if ((bx * bx + bz * bz) < r2) return true;
+        // If either endpoint is inside the sphere, treat as intersecting.
+        double a2 = ax * ax + ay * ay + az * az;
+        double b2 = bx * bx + by * by + bz * bz;
+        if (a2 < r2) return true;
+        if (b2 < r2) return true;
 
-        double d2 = dx * dx + dz * dz;
+        double d2 = dx * dx + dy * dy + dz * dz;
         if (d2 < 0.000001) {
             // Segment length is ~zero; endpoints already checked.
             return false;
         }
 
-        // Find closest approach to origin along the segment
-        double t = -((ax * dx) + (az * dz)) / d2;
-        if (t < 0.0) t = 0.0;
-        if (t > 1.0) t = 1.0;
+        // Solve |a + t d|^2 = r^2 for t in [0,1]
+        double bDot = 2.0 * (ax * dx + ay * dy + az * dz);
+        double c = a2 - r2;
 
-        double cx = ax + dx * t;
-        double cz = az + dz * t;
+        double disc = bDot * bDot - 4.0 * d2 * c;
+        if (disc < 0.0) return false;
 
-        double dist2 = cx * cx + cz * cz;
-        return dist2 < r2;
+        double sqrt = Math.sqrt(disc);
+        double t1 = (-bDot - sqrt) / (2.0 * d2);
+        double t2 = (-bDot + sqrt) / (2.0 * d2);
+
+        return (t1 >= 0.0 && t1 <= 1.0) || (t2 >= 0.0 && t2 <= 1.0);
     }
 
     /**
@@ -1099,6 +1281,14 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
      * "committed" stepping approach that is stable and avoids constant jitter.
      */
     private Location stepAlongPerimeterTowardsVictim(Location center, Location mobLoc, Location victimLoc, double perimeterRadius) {
+        // Walkers move around the sphere on the current Y slice.
+        double dy = mobLoc.getY() - center.getY();
+        double sliceR2 = (perimeterRadius * perimeterRadius) - (dy * dy);
+        double sliceRadius = (sliceR2 > 0) ? Math.sqrt(sliceR2) : 0.0;
+
+        // If the slice is effectively a point (near the top/bottom), fall back to a minimal circle.
+        if (sliceRadius < 0.5) sliceRadius = Math.max(0.5, perimeterRadius * 0.35);
+
         double ax = mobLoc.getX() - center.getX();
         double az = mobLoc.getZ() - center.getZ();
         double bx = victimLoc.getX() - center.getX();
@@ -1113,16 +1303,30 @@ public class ItStalksPlugin extends JavaPlugin implements Listener, CommandExecu
 
         // Convert configured step distance (blocks) to an angular step.
         // Clamp to avoid huge jumps on small radiuses and tiny jitter on large radiuses.
-        double stepAngle = fearAvoidStepDistance / Math.max(1.0, perimeterRadius);
+        double stepAngle = fearAvoidStepDistance / Math.max(1.0, sliceRadius);
         stepAngle = clamp(stepAngle, 0.02, 0.45);
 
         double nextTheta = thetaMob + dir * stepAngle;
 
-        double wx = center.getX() + perimeterRadius * Math.cos(nextTheta);
-        double wz = center.getZ() + perimeterRadius * Math.sin(nextTheta);
+        double wx = center.getX() + sliceRadius * Math.cos(nextTheta);
+        double wz = center.getZ() + sliceRadius * Math.sin(nextTheta);
 
         // Keep the current Y to avoid weird vertical demands on the ground pathfinder.
         return new Location(center.getWorld(), wx, mobLoc.getY(), wz);
+    }
+
+    /**
+     * Flying avoidance waypoint: place a target above the sphere so the Vex can fly "over" the safe zone.
+     */
+    private Location flyOverSphereWaypoint(Location center, double sphereRadius, Location victimLoc) {
+        Vector dir = victimLoc.toVector().subtract(center.toVector());
+        dir.setY(0);
+        if (dir.lengthSquared() < 0.0001) dir = new Vector(1, 0, 0);
+        dir.normalize().multiply(sphereRadius + 2.0);
+
+        Location wp = center.clone().add(dir);
+        wp.setY(center.getY() + sphereRadius + 4.0);
+        return wp;
     }
 
     private double wrapRadians(double r) {

@@ -62,7 +62,7 @@ fears:
 
   # Fear avoidance tuning (prevents the stalker from repeatedly entering the fear zone and fleeing)
   # Behaviour notes:
-  #  - If the cursed player is INSIDE the fear radius, the stalker will stand still at the edge.
+  #  - If the cursed player is INSIDE the fear radius, the stalker will freeze completely in place.
   #  - If the cursed player is OUTSIDE the radius but the fear zone blocks the direct path,
   #    the stalker will step around the perimeter until it has a clear route.
   # perimeter_buffer: extra distance added on top of each fear radius to create a stable "edge"
