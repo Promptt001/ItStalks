@@ -116,13 +116,13 @@ fears:
     radius: 8.0
   soul_torch:
     enabled: true
-    radius: 8.0
+    radius: 16.0
   soul_lantern:
     enabled: true
-    radius: 8.0
+    radius: 16.0
   beacon:
     enabled: true
-    radius: 16.0
+    radius: 32.0
 ```
 
 ## 🛠️ Building from Source
